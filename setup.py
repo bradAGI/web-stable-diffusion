@@ -24,6 +24,7 @@ setup(
         "Topic :: Software Development :: Build Tools",
         "License :: OSI Approved :: Apache Software License",
         "Programming Language :: Python :: 3",
-        "Programming Language :: Python :: 3.6",
-  ],
+        "Programming Language :: Python :: 3.8",
+    ],
+    python_requires=">=3.8",
 )
