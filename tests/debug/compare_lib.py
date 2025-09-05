@@ -1,7 +1,6 @@
-from typing import List
-
 import argparse
 import os
+from typing import List
 
 import numpy as np
 import tvm
