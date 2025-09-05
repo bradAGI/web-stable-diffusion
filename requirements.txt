@@ -1,3 +1,8 @@
 accelerate
 diffusers
 transformers
+torch==2.1.0
+tvm==0.15.0
+tqdm==4.66.2
+Pillow==10.2.0
+numpy==1.26.4
