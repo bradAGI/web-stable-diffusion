@@ -1,6 +1,6 @@
+import numpy as np
 import os
 import json
-import numpy as np
 import argparse
 from web_stable_diffusion.rpc_testing import WebGPUDebugSession
 
