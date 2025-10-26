@@ -18,7 +18,11 @@ from __future__ import annotations
 
 import concurrent.futures
 import hashlib
+import logging
 import math
+import multiprocessing
+import time
+from concurrent.futures import TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Set, Tuple, Union
 
@@ -50,6 +54,9 @@ from .modal_generators import (
     DeviceSpec,
     select_device,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -243,10 +250,33 @@ def _normalise(array: np.ndarray) -> np.ndarray:
 class OmniModalMiniturbo:
     """High level omni-modal synthesis engine with neuro-symbolic guidance."""
 
-    def __init__(self, *, diffusion_steps: int = 6) -> None:
+    def __init__(
+        self,
+        *,
+        diffusion_steps: int = 6,
+        device_spec: DeviceSpec | None = None,
+    ) -> None:
         self.meta_logic = MetaLogic()
-        self.device_spec = select_device()
+        self.device_spec = device_spec or select_device()
         self.diffusion_steps = diffusion_steps
+
+    # -- Validation helpers -----------------------------------------------
+    @staticmethod
+    def _ensure_positive(value: int, name: str, *, minimum: int = 1) -> int:
+        if not isinstance(value, int):
+            raise TypeError(f"{name} must be an integer, received {type(value)!r}")
+        if value < minimum:
+            raise ValueError(f"{name} must be >= {minimum}, received {value}")
+        return value
+
+    @staticmethod
+    def _ensure_prompt(prompt: str) -> str:
+        if not isinstance(prompt, str):
+            raise TypeError("prompt must be a string")
+        prompt = prompt.strip()
+        if not prompt:
+            raise ValueError("prompt cannot be empty")
+        return prompt
 
     # -- Prompt processing -------------------------------------------------
     def _prompt_embedding(self, prompt: str, size: int = 8) -> np.ndarray:
@@ -276,7 +306,16 @@ class OmniModalMiniturbo:
         refined = refined / (np.abs(refined).max() + 1e-6)
         return refined.astype(np.float32)
 
-    def generate_audio(self, prompt: str, *, length: int = 2048, sample_rate: int = 16000) -> DeviceAwareResult:
+    def generate_audio(
+        self,
+        prompt: str,
+        *,
+        length: int = 2048,
+        sample_rate: int = 16000,
+    ) -> DeviceAwareResult:
+        prompt = self._ensure_prompt(prompt)
+        length = self._ensure_positive(length, "length")
+        sample_rate = self._ensure_positive(sample_rate, "sample_rate", minimum=1000)
         embedding = self._prompt_embedding(prompt, size=6)
         waveform = self._synth_audio(embedding, length=length, sample_rate=sample_rate)
         metadata = {
@@ -303,6 +342,8 @@ class OmniModalMiniturbo:
         return _normalise(result)
 
     def generate_image(self, prompt: str, resolution: int = 256) -> DeviceAwareResult:
+        prompt = self._ensure_prompt(prompt)
+        resolution = self._ensure_positive(resolution, "resolution", minimum=16)
         embedding = self._prompt_embedding(prompt, size=12)
         latent = self._seed_latent(prompt, (resolution, resolution, 3))
         image = self._diffuse(latent, embedding)
@@ -326,7 +367,8 @@ class OmniModalMiniturbo:
         return guided
 
     def generate_volume(self, prompt: str, size: Optional[int] = None) -> DeviceAwareResult:
-        volume_size = size or 32
+        prompt = self._ensure_prompt(prompt)
+        volume_size = self._ensure_positive(size if size is not None else 32, "size", minimum=8)
         embedding = self._prompt_embedding(prompt, size=10)
         volume = self._synth_volume(prompt, embedding, volume_size)
         metadata = {
@@ -357,6 +399,10 @@ class OmniModalMiniturbo:
         frames: int = 16,
         resolution: int = 128,
     ) -> DeviceAwareResult:
+        prompt = self._ensure_prompt(prompt)
+        frames = self._ensure_positive(frames, "frames")
+        fps = self._ensure_positive(fps, "fps", minimum=1)
+        resolution = self._ensure_positive(resolution, "resolution", minimum=16)
         embedding = self._prompt_embedding(prompt, size=max(8, frames))
         video = self._synth_video(prompt, embedding, frames, resolution)
         metadata = {
@@ -376,8 +422,46 @@ class OmniModalMiniturbo:
         frames: int = 16,
         volume_size: int = 32,
         audio_length: int = 2048,
+        executor: str | None = None,
+        max_workers: Optional[int] = None,
+        timeout: Optional[float] = None,
     ) -> Dict[str, DeviceAwareResult]:
-        """Generate all modalities in parallel threads and return a bundle."""
+        """Generate all modalities in parallel and return a device-aware bundle.
+
+        Parameters
+        ----------
+        prompt:
+            Prompt text that seeds the symbolic and numerical generators.
+        resolution:
+            Base spatial resolution for image/video outputs.
+        frames:
+            Number of frames used for the video modality.
+        volume_size:
+            Edge length of the volumetric tensor.
+        audio_length:
+            Sample length of the audio waveform.
+        executor:
+            Force a specific executor implementation: ``"thread"``,
+            ``"process"`` or ``"auto"`` (default).  ``"process"`` is only
+            honoured when the selected device backend is NumPy because other
+            device types cannot be safely serialised across process boundaries.
+        max_workers:
+            Optional override for the parallel worker count.
+        timeout:
+            Optional wall-clock timeout (in seconds) for the entire bundle
+            generation call.  A ``TimeoutError`` is raised if the deadline is
+            exceeded.
+        """
+
+        prompt = self._ensure_prompt(prompt)
+        resolution = self._ensure_positive(resolution, "resolution", minimum=16)
+        frames = self._ensure_positive(frames, "frames")
+        volume_size = self._ensure_positive(volume_size, "volume_size", minimum=8)
+        audio_length = self._ensure_positive(audio_length, "audio_length")
+
+        exec_mode = (executor or "auto").lower()
+        if exec_mode not in {"auto", "thread", "process"}:
+            raise ValueError("executor must be 'auto', 'thread' or 'process'")
 
         tasks = {
             "audio": (self.generate_audio, {"prompt": prompt, "length": audio_length}),
@@ -385,19 +469,79 @@ class OmniModalMiniturbo:
             "volume": (self.generate_volume, {"prompt": prompt, "size": volume_size}),
             "video": (
                 self.generate_video,
-                {"prompt": prompt, "frames": frames, "resolution": resolution // 2},
+                {"prompt": prompt, "frames": frames, "resolution": max(16, resolution // 2)},
             ),
         }
 
+        worker_count = max_workers or len(tasks)
         results: Dict[str, DeviceAwareResult] = {}
-        with concurrent.futures.ThreadPoolExecutor(max_workers=len(tasks)) as executor:
-            future_to_key = {
-                executor.submit(func, **kwargs): key for key, (func, kwargs) in tasks.items()
-            }
-            for future in concurrent.futures.as_completed(future_to_key):
-                key = future_to_key[future]
-                results[key] = future.result()
+
+        deadline = time.perf_counter() + timeout if timeout is not None else None
+
+        def remaining_timeout() -> Optional[float]:
+            if deadline is None:
+                return None
+            remaining = deadline - time.perf_counter()
+            if remaining <= 0:
+                raise TimeoutError("bundle generation timed out before completion")
+            return remaining
+
+        should_use_process = (
+            exec_mode == "process"
+            or (exec_mode == "auto" and self.device_spec.backend == BACKEND_NUMPY)
+        ) and self.device_spec.backend == BACKEND_NUMPY
+
+        if should_use_process:
+            ctx = multiprocessing.get_context("spawn")
+            executor_cls = concurrent.futures.ProcessPoolExecutor
+            executor_kwargs: Dict[str, Any] = {"max_workers": worker_count, "mp_context": ctx}
+        else:
+            executor_cls = concurrent.futures.ThreadPoolExecutor
+            executor_kwargs = {"max_workers": worker_count}
+
+        with executor_cls(**executor_kwargs) as pool:
+            future_to_key: Dict[concurrent.futures.Future[DeviceAwareResult], Tuple[str, float]] = {}
+            for key, (func, kwargs) in tasks.items():
+                start = time.perf_counter()
+                if should_use_process:
+                    future = pool.submit(
+                        _execute_modality,
+                        key,
+                        kwargs,
+                        self.diffusion_steps,
+                        self.device_spec,
+                    )
+                else:
+                    future = pool.submit(func, **kwargs)
+                future_to_key[future] = (key, start)
+
+            try:
+                for future in concurrent.futures.as_completed(
+                    future_to_key, timeout=remaining_timeout()
+                ):
+                    key, start = future_to_key[future]
+                    duration = time.perf_counter() - start
+                    result = future.result()
+                    result.metadata.setdefault("metrics", {})["wall_clock_s"] = duration
+                    results[key] = result
+                    logger.debug("Generated modality %s in %.3fs", key, duration)
+            except FuturesTimeoutError as exc:
+                for future in future_to_key:
+                    future.cancel()
+                raise TimeoutError("bundle generation timed out before completion") from exc
+
         return results
+
+
+def _execute_modality(
+    modality: str,
+    kwargs: Dict[str, Any],
+    diffusion_steps: int,
+    device_spec: DeviceSpec,
+) -> DeviceAwareResult:
+    engine = OmniModalMiniturbo(diffusion_steps=diffusion_steps, device_spec=device_spec)
+    generator = getattr(engine, f"generate_{modality}")
+    return generator(**kwargs)
 
 
 __all__ = [
