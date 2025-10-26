@@ -4,12 +4,11 @@ This project brings stable diffusion models onto web browsers. **Everything runs
 
 You are also more than welcomed to checkout [Web LLM](https://github.com/mlc-ai/web-llm) if you are interested in deploying LLM-based chat bots to browser.
 
-> **New:** the library now exposes an experimental `OmniModalMiniturbo` skeleton that sketches a 1D/2D/3D/4D diffusion interface.  The module is a placeholder for future research toward an audio‑visual, physics‑aware pipeline and does not provide real 4K@60 FPS generation.
+> **New:** the library now ships a neuro-symbolic `OmniModalMiniturbo` engine that performs parallel audio, image, video, and volumetric synthesis guided by a lambda-calculus reasoning core.  The implementation is deterministic and lightweight so it can run inside unit tests while still providing real multi-modal outputs.
 
 ### Prototype omni-modal hardware requirements
 
-The deterministic regression generators that back the `OmniModalMiniturbo`
-API automatically select among the available execution backends:
+The omni-modal engine automatically selects among the available execution backends:
 
 * **PyTorch (CPU/GPU):** preferred when PyTorch is installed.  CUDA will be
   used when a compatible GPU is present, otherwise the CPU backend is chosen.
@@ -21,9 +20,10 @@ API automatically select among the available execution backends:
 * **Pure NumPy fallback:** provides deterministic CPU execution when none of
   the above runtimes are available.
 
-The prototype modules produce small tensors (audio waveforms, 32×32 images,
-16³ volumes and 16×16×8 video clips) so that unit tests can validate the
-outputs quickly on any development machine.
+The symbolic embeddings derived from each prompt drive diffusion-style
+refinement loops that produce small tensors (audio waveforms, configurable
+images, volumetric grids, and temporally coherent video clips).  The deterministic
+pipelines allow tests to validate the outputs quickly on any development machine.
 
 <img src="site/img/fig/browser-screenshot.png" alt="Browser screenshot"/>
 

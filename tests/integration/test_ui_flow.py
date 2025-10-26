@@ -4,6 +4,8 @@ from pathlib import Path
 
 import pytest
 
+pytest.importorskip("pytest_playwright", reason="pytest-playwright plugin is required for browser automation tests")
+
 pytestmark = pytest.mark.playwright
 
 
