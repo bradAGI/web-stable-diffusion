@@ -1,9 +1,19 @@
 from typing import Callable, Optional, Union
+import inspect
 import math
 
 import torch
 import torch.nn.functional as F
 from torch import nn
+
+
+if hasattr(F, "scaled_dot_product_attention"):
+    try:
+        _SDP_ATTENTION_HAS_SCALE = "scale" in inspect.signature(F.scaled_dot_product_attention).parameters
+    except (TypeError, ValueError):
+        _SDP_ATTENTION_HAS_SCALE = False
+else:
+    _SDP_ATTENTION_HAS_SCALE = False
 
 class Attention(nn.Module):
     r"""
@@ -128,11 +138,8 @@ class Attention(nn.Module):
         # set attention processor
         # We use the AttnProcessor2_0 by default when torch 2.x is used which uses
         # torch.nn.functional.scaled_dot_product_attention for native Flash/memory_efficient_attention
-        # but only if it has the default `scale` argument. TODO remove scale_qk check when we move to torch 2.1
         if processor is None:
-            processor = (
-                AttnProcessor2_0() if hasattr(F, "scaled_dot_product_attention") and self.scale_qk else AttnProcessor()
-            )
+            processor = AttnProcessor2_0() if hasattr(F, "scaled_dot_product_attention") else AttnProcessor()
         self.set_processor(processor)
 
 
@@ -215,16 +222,6 @@ class Attention(nn.Module):
 
     def prepare_attention_mask(self, attention_mask, target_length, batch_size=None, out_dim=3):
         if batch_size is None:
-            print("batch_size is None")
-            # deprecate(
-            #     "batch_size=None",
-            #     "0.0.15",
-            #     (
-            #         "Not passing the `batch_size` parameter to `prepare_attention_mask` can lead to incorrect"
-            #         " attention mask preparation and is deprecated behavior. Please make sure to pass `batch_size` to"
-            #         " `prepare_attention_mask` when preparing the attention_mask."
-            #     ),
-            # )
             batch_size = 1
 
         head_size = self.heads
@@ -233,22 +230,16 @@ class Attention(nn.Module):
 
         current_length: int = attention_mask.shape[-1]
 
-        print("current_length", current_length)
-        print("target_length", target_length)
-
-        if current_length != target_length:
+        if current_length < target_length:
+            remaining_length = target_length - current_length
             if attention_mask.device.type == "mps":
-                # HACK: MPS: Does not support padding by greater than dimension of input tensor.
-                # Instead, we can manually construct the padding tensor.
-                padding_shape = (attention_mask.shape[0], attention_mask.shape[1], target_length)
+                padding_shape = (attention_mask.shape[0], attention_mask.shape[1], remaining_length)
                 padding = torch.zeros(padding_shape, dtype=attention_mask.dtype, device=attention_mask.device)
                 attention_mask = torch.cat([attention_mask, padding], dim=2)
             else:
-                # TODO: for pipelines such as stable-diffusion, padding cross-attn mask:
-                #       we want to instead pad by (0, remaining_length), where remaining_length is:
-                #       remaining_length: int = target_length - current_length
-                # TODO: re-enable tests/models/test_models_unet_2d_condition.py#test_model_xattn_padding
-                attention_mask = F.pad(attention_mask, (0, target_length), value=0.0)
+                attention_mask = F.pad(attention_mask, (0, remaining_length), value=0.0)
+        elif current_length > target_length:
+            attention_mask = attention_mask[..., :target_length]
 
         if out_dim == 3:
             if attention_mask.shape[0] < batch_size * head_size:
@@ -402,11 +393,8 @@ class Attention_vae(nn.Module):
         # set attention processor
         # We use the AttnProcessor2_0 by default when torch 2.x is used which uses
         # torch.nn.functional.scaled_dot_product_attention for native Flash/memory_efficient_attention
-        # but only if it has the default `scale` argument. TODO remove scale_qk check when we move to torch 2.1
         if processor is None:
-            processor = (
-                AttnProcessor2_0_vae() if hasattr(F, "scaled_dot_product_attention") and self.scale_qk else AttnProcessor()
-            )
+            processor = AttnProcessor2_0_vae() if hasattr(F, "scaled_dot_product_attention") else AttnProcessor()
         self.set_processor(processor)
 
 
@@ -489,15 +477,6 @@ class Attention_vae(nn.Module):
 
     def prepare_attention_mask(self, attention_mask, target_length, batch_size=None, out_dim=3):
         if batch_size is None:
-            print(
-                "batch_size=None",
-                "0.0.15",
-                (
-                    "Not passing the `batch_size` parameter to `prepare_attention_mask` can lead to incorrect"
-                    " attention mask preparation and is deprecated behavior. Please make sure to pass `batch_size` to"
-                    " `prepare_attention_mask` when preparing the attention_mask."
-                ),
-            )
             batch_size = 1
 
         head_size = self.heads
@@ -505,19 +484,16 @@ class Attention_vae(nn.Module):
             return attention_mask
 
         current_length: int = attention_mask.shape[-1]
-        if current_length != target_length:
+        if current_length < target_length:
+            remaining_length = target_length - current_length
             if attention_mask.device.type == "mps":
-                # HACK: MPS: Does not support padding by greater than dimension of input tensor.
-                # Instead, we can manually construct the padding tensor.
-                padding_shape = (attention_mask.shape[0], attention_mask.shape[1], target_length)
+                padding_shape = (attention_mask.shape[0], attention_mask.shape[1], remaining_length)
                 padding = torch.zeros(padding_shape, dtype=attention_mask.dtype, device=attention_mask.device)
                 attention_mask = torch.cat([attention_mask, padding], dim=2)
             else:
-                # TODO: for pipelines such as stable-diffusion, padding cross-attn mask:
-                #       we want to instead pad by (0, remaining_length), where remaining_length is:
-                #       remaining_length: int = target_length - current_length
-                # TODO: re-enable tests/models/test_models_unet_2d_condition.py#test_model_xattn_padding
-                attention_mask = F.pad(attention_mask, (0, target_length), value=0.0)
+                attention_mask = F.pad(attention_mask, (0, remaining_length), value=0.0)
+        elif current_length > target_length:
+            attention_mask = attention_mask[..., :target_length]
 
         if out_dim == 3:
             if attention_mask.shape[0] < batch_size * head_size:
@@ -582,11 +558,11 @@ class AttnProcessor2_0:
         )
         inner_dim = hidden_states.shape[-1]
 
-        # if attention_mask is not None:
-        #     attention_mask = attn.prepare_attention_mask(attention_mask, sequence_length, batch_size)
-        #     # scaled_dot_product_attention expects attention_mask shape to be
-        #     # (batch, heads, source_length, target_length)
-        #     attention_mask = attention_mask.view(batch_size, attn.heads, -1, attention_mask.shape[-1])
+        if attention_mask is not None:
+            attention_mask = attn.prepare_attention_mask(attention_mask, sequence_length, batch_size)
+            attention_mask = attention_mask.view(batch_size, attn.heads, -1, attention_mask.shape[-1])
+            if attention_mask.dtype != torch.bool:
+                attention_mask = attention_mask.to(hidden_states.dtype)
 
         if attn.group_norm is not None:
             hidden_states = attn.group_norm(hidden_states.transpose(1, 2)).transpose(1, 2)
@@ -608,15 +584,22 @@ class AttnProcessor2_0:
         key = key.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
         value = value.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
 
-        # the output of sdp = (batch, num_heads, seq_len, head_dim)
-        # TODO: add support for attn.scale when we move to Torch 2.1
-        # hidden_states = F.scaled_dot_product_attention(
-        #     query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
-        # )
-        scale_factor = 1 / math.sqrt(query.size(-1))
-        attn_weight = query @ key.transpose(-2, -1) * scale_factor
-        attn_weight = torch.softmax(attn_weight, dim=-1)
-        hidden_states = attn_weight @ value
+        default_scale = 1 / math.sqrt(query.size(-1))
+        scale_kwargs = {}
+        if _SDP_ATTENTION_HAS_SCALE:
+            scale_kwargs["scale"] = attn.scale
+        elif not math.isclose(attn.scale, default_scale):
+            query = query * (attn.scale / default_scale)
+
+        hidden_states = F.scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            attn_mask=attention_mask,
+            dropout_p=0.0,
+            is_causal=False,
+            **scale_kwargs,
+        )
 
         hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
         hidden_states = hidden_states.to(query.dtype)
@@ -674,9 +657,9 @@ class AttnProcessor2_0_vae:
 
         if attention_mask is not None:
             attention_mask = attn.prepare_attention_mask(attention_mask, sequence_length, batch_size)
-            # scaled_dot_product_attention expects attention_mask shape to be
-            # (batch, heads, source_length, target_length)
             attention_mask = attention_mask.view(batch_size, attn.heads, -1, attention_mask.shape[-1])
+            if attention_mask.dtype != torch.bool:
+                attention_mask = attention_mask.to(hidden_states.dtype)
 
         if attn.group_norm is not None:
             hidden_states = attn.group_norm(hidden_states.transpose(1, 2)).transpose(1, 2)
@@ -698,15 +681,22 @@ class AttnProcessor2_0_vae:
         key = key.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
         value = value.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
 
-        # the output of sdp = (batch, num_heads, seq_len, head_dim)
-        # TODO: add support for attn.scale when we move to Torch 2.1
-        # hidden_states = F.scaled_dot_product_attention(
-        #     query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
-        # )
-        scale_factor = 1 / math.sqrt(query.size(-1))
-        attn_weight = query @ key.transpose(-2, -1) * scale_factor
-        attn_weight = torch.softmax(attn_weight, dim=-1)
-        hidden_states = attn_weight @ value
+        default_scale = 1 / math.sqrt(query.size(-1))
+        scale_kwargs = {}
+        if _SDP_ATTENTION_HAS_SCALE:
+            scale_kwargs["scale"] = attn.scale
+        elif not math.isclose(attn.scale, default_scale):
+            query = query * (attn.scale / default_scale)
+
+        hidden_states = F.scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            attn_mask=attention_mask,
+            dropout_p=0.0,
+            is_causal=False,
+            **scale_kwargs,
+        )
 
         hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
         hidden_states = hidden_states.to(query.dtype)

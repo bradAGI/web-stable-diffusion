@@ -220,11 +220,11 @@ class Transformer2DModel(nn.Module):
         # 4. Define output layers
         self.out_channels = in_channels if out_channels is None else out_channels
         if self.is_input_continuous:
-            # TODO: should use out_channels for continuous projections
+            target_channels = self.out_channels
             if use_linear_projection:
-                self.proj_out = nn.Linear(inner_dim, in_channels)
+                self.proj_out = nn.Linear(inner_dim, target_channels)
             else:
-                self.proj_out = nn.Conv2d(inner_dim, in_channels, kernel_size=1, stride=1, padding=0)
+                self.proj_out = nn.Conv2d(inner_dim, target_channels, kernel_size=1, stride=1, padding=0)
         elif self.is_input_vectorized:
             self.norm_out = nn.LayerNorm(inner_dim)
             self.out = nn.Linear(inner_dim, self.num_vector_embeds - 1)
@@ -337,7 +337,10 @@ class Transformer2DModel(nn.Module):
                 hidden_states = self.proj_out(hidden_states)
                 hidden_states = hidden_states.reshape(batch, height, width, inner_dim).permute(0, 3, 1, 2).contiguous()
 
-            output = hidden_states + residual
+            if residual.shape[1] == hidden_states.shape[1]:
+                output = hidden_states + residual
+            else:
+                output = hidden_states
         elif self.is_input_vectorized:
             hidden_states = self.norm_out(hidden_states)
             logits = self.out(hidden_states)
@@ -347,7 +350,6 @@ class Transformer2DModel(nn.Module):
             # log(p(x_0))
             output = F.log_softmax(logits.double(), dim=1).float()
         elif self.is_input_patches:
-            # TODO: cleanup!
             conditioning = self.transformer_blocks[0].norm1.emb(
                 timestep, class_labels, hidden_dtype=hidden_states.dtype
             )
@@ -368,5 +370,4 @@ class Transformer2DModel(nn.Module):
         if not return_dict:
             return (output,)
 
-        #TODO: verify that this is correct
         return output
