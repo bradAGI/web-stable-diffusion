@@ -18,6 +18,11 @@ setup(
         "diffusers",
         "transformers"
     ],
+    entry_points={
+        "console_scripts": [
+            "omnimodal-generate=web_stable_diffusion.cli.omnimodal:main",
+        ]
+    },
     classifiers = [
         "Development Status :: 3 - Alpha",
         "Intended Audience :: Developers",
