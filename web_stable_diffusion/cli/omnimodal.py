@@ -3,7 +3,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import pathlib
+import sys
+import time
 from typing import Any, Dict
 
 import numpy as np
@@ -37,16 +40,55 @@ def _build_parser() -> argparse.ArgumentParser:
         default="manifest.json",
         help="Filename of the JSON manifest relative to the output directory",
     )
+    parser.add_argument(
+        "--executor",
+        choices=["auto", "thread", "process"],
+        default="auto",
+        help="Execution backend used for parallel generation",
+    )
+    parser.add_argument(
+        "--max-workers",
+        type=int,
+        default=None,
+        help="Optional override for the executor worker count",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=None,
+        help="Optional timeout in seconds for bundle generation",
+    )
+    parser.add_argument(
+        "--log-level",
+        default="WARNING",
+        choices=["CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"],
+        help="Logging verbosity for the CLI run",
+    )
     return parser
 
 
-def _bundle_to_manifest(bundle: Dict[str, Any], base_dir: pathlib.Path) -> Dict[str, Any]:
-    manifest: Dict[str, Any] = {"artifacts": {}, "metadata": {"base_dir": str(base_dir)}}
+def _bundle_to_manifest(
+    bundle: Dict[str, Any],
+    base_dir: pathlib.Path,
+    *,
+    executor: str,
+    device_backend: str,
+) -> Dict[str, Any]:
+    manifest: Dict[str, Any] = {
+        "artifacts": {},
+        "metadata": {
+            "base_dir": str(base_dir),
+            "executor": executor,
+            "device_backend": device_backend,
+            "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        },
+    }
+    total_duration = 0.0
     for key, result in bundle.items():
         array = result.to_numpy()
         artifact_path = base_dir / f"{key}.npz"
         file_path = _serialise_payload(array, artifact_path)
-        manifest["artifacts"][key] = {
+        entry: Dict[str, Any] = {
             "file": file_path,
             "shape": list(array.shape),
             "dtype": str(array.dtype),
@@ -54,6 +96,12 @@ def _bundle_to_manifest(bundle: Dict[str, Any], base_dir: pathlib.Path) -> Dict[
             "device": result.device,
             "metadata": result.metadata,
         }
+        metrics = result.metadata.get("metrics") if isinstance(result.metadata, dict) else None
+        if metrics and "wall_clock_s" in metrics:
+            total_duration += float(metrics["wall_clock_s"])
+        manifest["artifacts"][key] = entry
+    if total_duration:
+        manifest["metadata"]["metrics"] = {"wall_clock_s_total": total_duration}
     return manifest
 
 
@@ -61,19 +109,43 @@ def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
 
-    engine = OmniModalMiniturbo()
-    bundle = engine.generate_bundle(
-        prompt=args.prompt,
-        resolution=args.resolution,
-        frames=args.frames,
-        volume_size=args.volume_size,
-        audio_length=args.audio_length,
+    logging.basicConfig(
+        level=getattr(logging, args.log_level.upper()),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    logger = logging.getLogger(__name__)
+
+    if args.max_workers is not None and args.max_workers <= 0:
+        parser.error("--max-workers must be a positive integer")
+    if args.timeout is not None and args.timeout <= 0:
+        parser.error("--timeout must be greater than zero")
+
+    engine = OmniModalMiniturbo()
+    try:
+        bundle = engine.generate_bundle(
+            prompt=args.prompt,
+            resolution=args.resolution,
+            frames=args.frames,
+            volume_size=args.volume_size,
+            audio_length=args.audio_length,
+            executor=args.executor,
+            max_workers=args.max_workers,
+            timeout=args.timeout,
+        )
+    except Exception as exc:  # pragma: no cover - error paths exercised in tests via str(exc)
+        logger.error("Failed to generate omni-modal bundle: %s", exc, exc_info=True)
+        print(json.dumps({"error": str(exc)}), file=sys.stderr)
+        return 1
 
     output_dir: pathlib.Path = args.output
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    manifest = _bundle_to_manifest(bundle, output_dir)
+    manifest = _bundle_to_manifest(
+        bundle,
+        output_dir,
+        executor=args.executor,
+        device_backend=engine.device_spec.backend,
+    )
     manifest_path = output_dir / args.manifest_name
     manifest_path.write_text(json.dumps(manifest, indent=2))
 

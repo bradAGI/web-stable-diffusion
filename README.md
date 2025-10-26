@@ -40,6 +40,16 @@ installed via `pip`, the same functionality is available through the
 `omnimodal-generate` console script.  Because the payloads remain lightweight,
 they can be versioned, inspected, or piped into downstream evaluation tooling.
 
+Key flags expose production-ready ergonomics:
+
+* `--executor {auto,thread,process}` controls the parallel backend.  Process
+  pools are chosen automatically when the NumPy backend is active so CPU-bound
+  tasks can scale beyond the Python GIL.
+* `--max-workers` and `--timeout` provide coarse resource budgets for batch
+  executions.
+* `--log-level` enables structured logging for integration into observability
+  stacks.
+
 <img src="site/img/fig/browser-screenshot.png" alt="Browser screenshot"/>
 
 We have been seeing amazing progress through AI models recently. Thanks to the open-source effort, developers can now easily compose open-source models together to produce amazing tasks. Stable diffusion enables the automatic creation of photorealistic images as well as images in various styles based on text input. These models are usually big and compute-heavy, which means we have to pipe through all computation requests to (GPU) servers when developing web applications based on these models. Additionally, most of the workloads have to run on a specific type of GPUs where popular deep-learning frameworks are readily available.
