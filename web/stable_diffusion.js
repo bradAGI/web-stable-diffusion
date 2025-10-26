@@ -29,6 +29,372 @@ function setProgressValue(id, value) {
 }
 
 /**
+ * Lightweight wrapper that converts TVM NDArrays to transferable payloads.
+ * The helper prefers GPU backed buffers but falls back to CPU typed arrays
+ * when the underlying handle does not expose a transferable representation.
+ */
+class TransferableNDArray {
+  constructor(ndarray) {
+    this.ndarray = ndarray;
+  }
+
+  /**
+   * Export the NDArray into a transferable message.
+   * @returns {{shape: number[], dtype: string, buffer: ArrayBuffer}}
+   */
+  toMessage() {
+    if (!this.ndarray) {
+      throw Error("Attempted to serialize a disposed array");
+    }
+    const typedArray = this.ndarray.toArray();
+    return {
+      shape: Array.from(this.ndarray.shape),
+      dtype: this.ndarray.dtype,
+      buffer: typedArray.buffer
+    };
+  }
+
+  /**
+   * Import a transferable message back into a TVM NDArray on the
+   * specified device.
+   * @param tvm The tvm runtime instance.
+   * @param device Target device.
+   * @param payload The transferable payload.
+   */
+  static fromMessage(tvm, device, payload) {
+    const ctor = TransferableNDArray.#getTypedArrayCtor(payload.dtype);
+    const typedArray = new ctor(payload.buffer);
+    const result = tvm.empty(payload.shape, payload.dtype, device);
+    result.copyFrom(typedArray);
+    return result;
+  }
+
+  static #getTypedArrayCtor(dtype) {
+    switch (dtype) {
+    case "float32":
+      return Float32Array;
+    case "float16":
+      return Uint16Array;
+    case "int32":
+      return Int32Array;
+    case "uint8":
+      return Uint8Array;
+    default:
+      throw Error("Unsupported dtype " + dtype);
+    }
+  }
+}
+
+/**
+ * Simple asynchronous command queue with back-pressure control.
+ */
+class CommandQueue {
+  constructor(maxInFlight = 2) {
+    this.maxInFlight = Math.max(1, maxInFlight);
+    this.pending = [];
+    this.inFlight = 0;
+  }
+
+  enqueue(fn) {
+    return new Promise((resolve, reject) => {
+      const command = { fn, resolve, reject };
+      command.resultPromise = new Promise((innerResolve, innerReject) => {
+        command.resolveWrapper = innerResolve;
+        command.rejectWrapper = innerReject;
+      });
+      this.pending.push(command);
+      this.#drain();
+    });
+  }
+
+  flush() {
+    if (this.inFlight === 0 && this.pending.length === 0) {
+      return Promise.resolve();
+    }
+    return Promise.all(
+      this.pending
+        .map((cmd) => cmd.resultPromise)
+        .filter((promise) => promise !== undefined)
+    );
+  }
+
+  #drain() {
+    while (this.inFlight < this.maxInFlight && this.pending.length > 0) {
+      const command = this.pending.shift();
+      this.inFlight += 1;
+      Promise.resolve()
+        .then(() => command.fn())
+        .then((value) => {
+          this.inFlight -= 1;
+          command.resolve(value);
+          if (command.resolveWrapper) {
+            command.resolveWrapper(value);
+          }
+          this.#drain();
+        })
+        .catch((err) => {
+          this.inFlight -= 1;
+          command.reject(err);
+          if (command.rejectWrapper) {
+            command.rejectWrapper(err);
+          }
+          this.#drain();
+        });
+    }
+  }
+}
+
+/**
+ * Minimal worker abstraction that attempts to spawn a dedicated Web Worker
+ * for a stage but gracefully falls back to local execution when the
+ * environment prevents worker creation (e.g., during tests).
+ */
+class StageWorker {
+  constructor(name, executor, options = {}) {
+    this.name = name;
+    this.executor = executor;
+    this.worker = undefined;
+    this.useWorker = options.useWorker !== undefined ? options.useWorker : true;
+    if (this.useWorker) {
+      this.#initWorker();
+    }
+  }
+
+  async run(payload) {
+    if (this.worker === undefined) {
+      return await this.executor(payload);
+    }
+    const message = { id: StageWorker.#nextMessageId(), payload };
+    return new Promise((resolve, reject) => {
+      const handleMessage = (evt) => {
+        if (evt.data.id !== message.id) {
+          return;
+        }
+        this.worker.removeEventListener("message", handleMessage);
+        if (evt.data.status === "ok") {
+          resolve(evt.data.result);
+        } else {
+          reject(new Error(evt.data.error));
+        }
+      };
+      this.worker.addEventListener("message", handleMessage);
+      const transferList = payload && payload.transferList ? payload.transferList : undefined;
+      if (transferList) {
+        this.worker.postMessage(message, transferList);
+      } else {
+        this.worker.postMessage(message);
+      }
+    });
+  }
+
+  dispose() {
+    if (this.worker !== undefined) {
+      this.worker.terminate();
+      this.worker = undefined;
+    }
+  }
+
+  #initWorker() {
+    if (typeof Worker === "undefined") {
+      return;
+    }
+    try {
+      const source = `
+        const executor = (${this.executor.toString()});
+        self.onmessage = async (evt) => {
+          const { id, payload } = evt.data;
+          try {
+            const result = await executor(payload);
+            self.postMessage({ id, status: "ok", result });
+          } catch (err) {
+            self.postMessage({ id, status: "error", error: err.message || String(err) });
+          }
+        };
+      `;
+      const blob = new Blob([source], { type: "application/javascript" });
+      const url = URL.createObjectURL(blob);
+      this.worker = new Worker(url, { name: this.name });
+    } catch (err) {
+      console.warn("Falling back to main thread execution for stage", this.name, err);
+      this.worker = undefined;
+    }
+  }
+
+  static #nextMessageId() {
+    StageWorker._counter = (StageWorker._counter || 0) + 1;
+    return StageWorker._counter;
+  }
+}
+
+/**
+ * Pool that keeps track of the stage workers used by the runtime.
+ */
+class StageWorkerPool {
+  constructor(enableWorkers = true) {
+    this.enableWorkers = enableWorkers;
+    this.clipWorker = undefined;
+    this.unetWorker = undefined;
+    this.vaeWorker = undefined;
+  }
+
+  init(clipExec, unetExec, vaeExec) {
+    this.dispose();
+    const workerOptions = { useWorker: this.enableWorkers };
+    this.clipWorker = new StageWorker("clip-stage", clipExec, workerOptions);
+    this.unetWorker = new StageWorker("unet-stage", unetExec, workerOptions);
+    this.vaeWorker = new StageWorker("vae-stage", vaeExec, workerOptions);
+  }
+
+  dispose() {
+    if (this.clipWorker) {
+      this.clipWorker.dispose();
+    }
+    if (this.unetWorker) {
+      this.unetWorker.dispose();
+    }
+    if (this.vaeWorker) {
+      this.vaeWorker.dispose();
+    }
+  }
+}
+
+/**
+ * Orchestrates collaborative generation features with server offloading.
+ */
+class CollaborativeGenerationManager {
+  constructor(logger) {
+    this.logger = logger;
+    this.transport = undefined;
+    this.rtcPeer = undefined;
+    this.latencyHistory = [];
+    this.healthListeners = new Set();
+  }
+
+  async ensureTransport(url) {
+    if (this.transport || typeof WebTransport === "undefined") {
+      return;
+    }
+    try {
+      this.transport = new WebTransport(url);
+      await this.transport.ready;
+      this.logger("WebTransport channel ready" );
+      this.#monitorTransport();
+    } catch (err) {
+      this.logger("WebTransport connection failed: " + err.message);
+      this.transport = undefined;
+    }
+  }
+
+  async ensurePeerConnection(config = {}) {
+    if (this.rtcPeer) {
+      return;
+    }
+    if (typeof RTCPeerConnection === "undefined") {
+      return;
+    }
+    this.rtcPeer = new RTCPeerConnection(config);
+    this.dataChannel = this.rtcPeer.createDataChannel("generation-updates");
+    this.dataChannel.onmessage = (evt) => {
+      this.#recordLatency("webrtc", evt.data);
+    };
+    this.dataChannel.onopen = () => {
+      this.logger("WebRTC data channel established");
+    };
+    this.dataChannel.onclose = () => {
+      this.logger("WebRTC data channel closed");
+    };
+  }
+
+  broadcastStageSnapshot(stage, payload) {
+    const timestamp = performance.now();
+    if (this.transport) {
+      try {
+        const writer = this.transport.datagrams.writable.getWriter();
+        const json = JSON.stringify({ stage, payload, timestamp });
+        writer.write(new TextEncoder().encode(json))
+          .catch((err) => {
+            this.logger("Transport write failed: " + err.message);
+          })
+          .finally(() => {
+            writer.releaseLock();
+          });
+      } catch (err) {
+        this.logger("Transport write failed: " + err.message);
+      }
+    }
+    if (this.dataChannel && this.dataChannel.readyState === "open") {
+      try {
+        this.dataChannel.send(JSON.stringify({ stage, payload, timestamp }));
+      } catch (err) {
+        this.logger("WebRTC send failed: " + err.message);
+      }
+    }
+  }
+
+  onHealthUpdate(cb) {
+    this.healthListeners.add(cb);
+    return () => this.healthListeners.delete(cb);
+  }
+
+  #recordLatency(channel, rawMessage) {
+    try {
+      const parsed = JSON.parse(rawMessage);
+      if (!parsed.timestamp) {
+        return;
+      }
+      const latency = performance.now() - parsed.timestamp;
+      this.latencyHistory.push({ channel, latency });
+      this.latencyHistory = this.latencyHistory.slice(-100);
+      this.healthListeners.forEach((cb) => cb({ channel, latency }));
+    } catch (err) {
+      this.logger("Latency parsing failed: " + err.message);
+    }
+  }
+
+  #monitorTransport() {
+    if (!this.transport) {
+      return;
+    }
+    const interval = setInterval(() => {
+      if (!this.transport) {
+        clearInterval(interval);
+        return;
+      }
+      try {
+        this.broadcastStageSnapshot("health", { timestamp: performance.now() });
+      } catch (err) {
+        this.logger("Health ping failed: " + err.message);
+      }
+    }, 5000);
+  }
+
+  dispose() {
+    if (this.transport) {
+      try {
+        this.transport.close();
+      } catch (_) {
+      }
+      this.transport = undefined;
+    }
+    if (this.dataChannel) {
+      try {
+        this.dataChannel.close();
+      } catch (_) {
+      }
+      this.dataChannel = undefined;
+    }
+    if (this.rtcPeer) {
+      try {
+        this.rtcPeer.close();
+      } catch (_) {
+      }
+      this.rtcPeer = undefined;
+    }
+    this.healthListeners.clear();
+  }
+}
+
+/**
  * Wrapper to handle PNDM scheduler
  */
 class TVMPNDMScheduler {
@@ -129,6 +495,15 @@ class TVMPNDMScheduler {
     );
     return prevLatents;
   }
+
+  prefetch(counter) {
+    return {
+      timestep: this.timestep[counter],
+      sampleCoeff: this.sampleCoeff[counter],
+      alphaDiff: this.alphaDiff[counter],
+      modelOutputDenomCoeff: this.modelOutputDenomCoeff[counter]
+    };
+  }
 }
 
 /**
@@ -208,6 +583,17 @@ class TVMDPMSolverMultistepScheduler {
 
     return prevLatents;
   }
+
+  prefetch(counter) {
+    return {
+      timestep: this.timestep[counter],
+      alpha: this.alpha[counter],
+      sigma: this.sigma[counter],
+      c0: this.c0[counter],
+      c1: this.c1[counter],
+      c2: this.c2[counter]
+    };
+  }
 }
 
 class EulerDiscreteScheduler {
@@ -267,6 +653,13 @@ class EulerDiscreteScheduler {
     return prevLatents;
   }
 
+  prefetch(counter) {
+    return {
+      timestep: this.timestep[counter],
+      sigma: this.sigma[counter]
+    };
+  }
+
   scaleModelInput(sample, counter) {
     const result = this.ScaleModelInputFunc(
       sample,
@@ -318,6 +711,59 @@ class StableDiffusionPipeline {
     this.concatEmbeddings = this.tvm.detachFromCurrentScope(
       this.vm.getFunction("concat_embeddings")
     );
+    this.workerPool = new StageWorkerPool(false);
+    this.collaborationManager = undefined;
+  }
+
+  #convertIdsMessageToNDArray(message) {
+    return TransferableNDArray.fromMessage(this.tvm, this.device, message);
+  }
+
+  #encodePromptFromWorker(payload) {
+    return this.tvm.withNewScope(() => {
+      const ids = this.#convertIdsMessageToNDArray(payload.inputMessage);
+      const result = this.tvm.detachFromCurrentScope(
+        this.clipToTextEmbeddings(ids, this.clipParams)
+      );
+      const transferable = new TransferableNDArray(result).toMessage();
+      transferable.transferList = [transferable.buffer];
+      result.dispose();
+      return transferable;
+    });
+  }
+
+  #runUnetFromWorker(payload) {
+    const { latentsMessage, timestepHandle, embeddingsMessage, scheduler, counter } = payload;
+    return this.tvm.withNewScope(() => {
+      const latents = TransferableNDArray.fromMessage(this.tvm, this.device, latentsMessage);
+      const embeddings = TransferableNDArray.fromMessage(this.tvm, this.device, embeddingsMessage);
+      const timestep = timestepHandle ? timestepHandle.timestep : scheduler.timestep[counter];
+      const noisePred = this.unetLatentsToNoisePred(
+        latents,
+        timestep,
+        embeddings,
+        this.unetParams
+      );
+      const nextLatents = scheduler.step(noisePred, latents, counter);
+      const detached = this.tvm.detachFromCurrentScope(nextLatents);
+      const transferable = new TransferableNDArray(detached).toMessage();
+      transferable.transferList = [transferable.buffer];
+      detached.dispose();
+      return transferable;
+    });
+  }
+
+  #runVaeFromWorker(payload) {
+    return this.tvm.withNewScope(() => {
+      const latents = TransferableNDArray.fromMessage(this.tvm, this.device, payload.latentsMessage);
+      const image = this.vaeToImage(latents, this.vaeParams);
+      const rgba = this.imageToRGBA(image);
+      const detached = this.tvm.detachFromCurrentScope(rgba);
+      const transferable = new TransferableNDArray(detached).toMessage();
+      transferable.transferList = [transferable.buffer];
+      detached.dispose();
+      return transferable;
+    });
   }
 
   dispose() {
@@ -331,6 +777,11 @@ class StableDiffusionPipeline {
     this.clipParams.dispose();
     this.clipToTextEmbeddings.dispose();
     this.vm.dispose();
+    this.workerPool.dispose();
+  }
+
+  setCollaborativeManager(manager) {
+    this.collaborationManager = manager;
   }
 
   /**
@@ -389,6 +840,7 @@ class StableDiffusionPipeline {
     // get latents
     const latentShape = [1, 4, 64, 64];
 
+    let scheduler;
     var unetNumSteps;
     if (schedulerId == 0) {
       scheduler = new TVMDPMSolverMultistepScheduler(
@@ -401,22 +853,66 @@ class StableDiffusionPipeline {
     }
     const totalNumSteps = unetNumSteps + 2;
 
+    this.workerPool.init(
+      (payload) => this.#encodePromptFromWorker(payload),
+      (payload) => this.#runUnetFromWorker(payload),
+      (payload) => this.#runVaeFromWorker(payload)
+    );
+
     if (progressCallback !== undefined) {
       progressCallback("clip", 0, 1, totalNumSteps);
     }
 
+    const clipQueue = new CommandQueue(2);
+    const posInputIDs = this.tokenize(prompt);
+    const negInputIDs = this.tokenize(negPrompt);
+    await this.device.sync();
+    const posMessage = new TransferableNDArray(posInputIDs).toMessage();
+    const negMessage = new TransferableNDArray(negInputIDs).toMessage();
+    posMessage.transferList = [posMessage.buffer];
+    negMessage.transferList = [negMessage.buffer];
+
+    const [posEmbeddingMessage, negEmbeddingMessage] = await Promise.all([
+      clipQueue.enqueue(() => this.workerPool.clipWorker.run({
+        stage: "clip",
+        negative: false,
+        inputMessage: posMessage,
+        transferList: posMessage.transferList
+      })),
+      clipQueue.enqueue(() => this.workerPool.clipWorker.run({
+        stage: "clip",
+        negative: true,
+        inputMessage: negMessage,
+        transferList: negMessage.transferList
+      }))
+    ]);
+
+    posInputIDs.dispose();
+    negInputIDs.dispose();
+
     const embeddings = this.tvm.withNewScope(() => {
-      let posInputIDs = this.tokenize(prompt);
-      let negInputIDs = this.tokenize(negPrompt);
-      const posEmbeddings = this.clipToTextEmbeddings(
-        posInputIDs, this.clipParams);
-      const negEmbeddings = this.clipToTextEmbeddings(
-        negInputIDs, this.clipParams);
-      // maintain new latents
+      const posEmbeddings = TransferableNDArray.fromMessage(
+        this.tvm,
+        this.device,
+        posEmbeddingMessage
+      );
+      const negEmbeddings = TransferableNDArray.fromMessage(
+        this.tvm,
+        this.device,
+        negEmbeddingMessage
+      );
       return this.tvm.detachFromCurrentScope(
         this.concatEmbeddings(negEmbeddings, posEmbeddings)
       );
     });
+
+    if (this.collaborationManager) {
+      this.collaborationManager.broadcastStageSnapshot("clip", {
+        promptLength: prompt.length,
+        negativePromptLength: negPrompt.length
+      });
+    }
+
     // use uniform distribution with same variance as normal(0, 1)
     const scale = Math.sqrt(12) / 2;
     let latents = this.tvm.detachFromCurrentScope(
@@ -436,8 +932,21 @@ class StableDiffusionPipeline {
     //---------------------------
     // Stage 1: UNet + Scheduler
     //---------------------------
+    const embeddingsMessage = new TransferableNDArray(embeddings).toMessage();
+    embeddingsMessage.transferList = [embeddingsMessage.buffer];
+    let latentsMessage = new TransferableNDArray(latents).toMessage();
+    latentsMessage.transferList = [latentsMessage.buffer];
+    const unetQueue = new CommandQueue(2);
+    const schedulerPrefetchCache = new Map();
+    const acquireSchedulerHandle = (index) => {
+      if (!schedulerPrefetchCache.has(index)) {
+        schedulerPrefetchCache.set(index, scheduler.prefetch(index));
+      }
+      return schedulerPrefetchCache.get(index);
+    };
+    const collaboration = this.collaborationManager;
+
     if (vaeCycle != -1) {
-      // show first frame
       this.tvm.withNewScope(() => {
         const image = this.vaeToImage(latents, this.vaeParams);
         this.tvm.showImage(this.imageToRGBA(image));
@@ -451,26 +960,38 @@ class StableDiffusionPipeline {
       if (progressCallback !== undefined) {
         progressCallback("unet", counter, unetNumSteps, totalNumSteps);
       }
-      const timestep = scheduler.timestep[counter];
-      // recycle noisePred, track latents manually
-      const newLatents = this.tvm.withNewScope(() => {
-        this.tvm.attachToCurrentScope(latents);
-        const noisePred = this.unetLatentsToNoisePred(
-          latents, timestep, embeddings, this.unetParams);
-        // maintain new latents
-        return this.tvm.detachFromCurrentScope(
-          scheduler.step(noisePred, latents, counter)
-        );
-      });
-      latents = newLatents;
-      // use skip one sync, although likely not as useful.
+      const timestepHandle = acquireSchedulerHandle(counter);
+      const resultMessage = await unetQueue.enqueue(() => this.workerPool.unetWorker.run({
+        stage: "unet",
+        latentsMessage,
+        embeddingsMessage,
+        scheduler,
+        counter,
+        timestepHandle,
+        transferList: latentsMessage.transferList
+      }));
+
+      latents.dispose();
+      latents = TransferableNDArray.fromMessage(this.tvm, this.device, resultMessage);
+      latentsMessage = new TransferableNDArray(latents).toMessage();
+      latentsMessage.transferList = [latentsMessage.buffer];
+
+      if (collaboration) {
+        collaboration.broadcastStageSnapshot("unet", {
+          counter,
+          total: unetNumSteps
+        });
+      }
+
       if (lastSync !== undefined) {
         await lastSync;
       }
-      // async event checker
       lastSync = this.device.sync();
 
-      // Optionally, we can draw intermediate result of VAE.
+      if ((counter + 1) < unetNumSteps) {
+        unetQueue.enqueue(() => acquireSchedulerHandle(counter + 1));
+      }
+
       if ((counter + 1) % vaeCycle == 0 &&
         (counter + 1) != unetNumSteps &&
         counter >= beginRenderVae) {
@@ -506,10 +1027,20 @@ class StableDiffusionPipeline {
     if (progressCallback !== undefined) {
       progressCallback("vae", 0, 1, totalNumSteps);
     }
-    this.tvm.withNewScope(() => {
-      const image = this.vaeToImage(latents, this.vaeParams);
-      this.tvm.showImage(this.imageToRGBA(image));
+    const vaeResultMessage = await this.workerPool.vaeWorker.run({
+      stage: "vae",
+      latentsMessage,
+      transferList: latentsMessage.transferList
     });
+    this.tvm.withNewScope(() => {
+      const rgba = TransferableNDArray.fromMessage(this.tvm, this.device, vaeResultMessage);
+      this.tvm.showImage(rgba);
+    });
+    if (this.collaborationManager) {
+      this.collaborationManager.broadcastStageSnapshot("vae", {
+        status: "complete"
+      });
+    }
     latents.dispose();
     await this.device.sync();
     if (progressCallback !== undefined) {
@@ -579,7 +1110,8 @@ class DiffusionXLPipeline {
     this.concatEncoderOutputs = this.tvm.detachFromCurrentScope(
       this.vm.getFunction("concat_enocder_outputs")
     );
-
+    this.workerPool = new StageWorkerPool(false);
+    this.collaborationManager = undefined;
   }
 
   dispose() {
@@ -598,6 +1130,10 @@ class DiffusionXLPipeline {
     this.clipParams2.dispose();
     this.clipToTextEmbeddings2.dispose();
     this.vm.dispose();
+  }
+
+  setCollaborativeManager(manager) {
+    this.collaborationManager = manager;
   }
 
   tokenize(prompt, tokenizer) {
@@ -749,6 +1285,11 @@ class DiffusionXLPipeline {
       const image = this.vaeToImage(latents, this.vaeParams);
       this.tvm.showImage(this.imageToRGBA(image));
     });
+    if (this.collaborationManager) {
+      this.collaborationManager.broadcastStageSnapshot("vae", {
+        status: "complete"
+      });
+    }
     latents.dispose();
     await this.device.sync();
     if (progressCallback !== undefined) {
@@ -772,6 +1313,7 @@ class StableDiffusionInstance {
     this.generateInProgress = false;
     this.requestInProgress = false;
     this.logger = console.log;
+    this.collaborationManager = new CollaborativeGenerationManager((message) => this.logger(message));
     this.model = "Stable-Diffusion-XL"
   }
   /**
@@ -873,6 +1415,9 @@ class StableDiffusionInstance {
       this.pipeline = this.tvm.withNewScope(() => {
         return new DiffusionXLPipeline(this.tvm, tokenizer1, tokenizer2, schedulerConst, this.tvm.cacheMetadata);
       });
+      if (this.pipeline.setCollaborativeManager !== undefined) {
+        this.pipeline.setCollaborativeManager(this.collaborationManager);
+      }
       await this.pipeline.asyncLoadWebGPUPipelines();
     }
     else {
@@ -881,6 +1426,7 @@ class StableDiffusionInstance {
       this.pipeline = this.tvm.withNewScope(() => {
         return new StableDiffusionPipeline(this.tvm, tokenizer, schedulerConst, this.tvm.cacheMetadata);
       });
+      this.pipeline.setCollaborativeManager(this.collaborationManager);
       await this.pipeline.asyncLoadWebGPUPipelines();
     }
   }
@@ -1018,6 +1564,32 @@ class StableDiffusionInstance {
     await this.#asyncInitConfig();
     await this.#asyncInitTVM(this.config.wasmUrl, this.config.cacheUrl);
     await this.#asyncInitPipeline(this.config.schedulerConstUrl, this.config.tokenizer, this.config.tokenizer2);
+    await this.#setupCollaboration();
+  }
+
+  async #setupCollaboration() {
+    if (!this.collaborationManager || !this.config) {
+      return;
+    }
+    const settings = this.config.collaboration;
+    if (!settings) {
+      return;
+    }
+    if (settings.webtransportUrl) {
+      await this.collaborationManager.ensureTransport(settings.webtransportUrl);
+    }
+    if (settings.webrtcConfig) {
+      await this.collaborationManager.ensurePeerConnection(settings.webrtcConfig);
+    }
+    const healthLabelId = settings.healthElementId || "network-health-label";
+    if (healthLabelId) {
+      const label = document.getElementById(healthLabelId);
+      if (label) {
+        this.collaborationManager.onHealthUpdate(({ channel, latency }) => {
+          label.innerText = `Network ${channel}: ${latency.toFixed(1)}ms`;
+        });
+      }
+    }
   }
 
   /**
@@ -1114,6 +1686,10 @@ class StableDiffusionInstance {
       this.tvm = undefined;
     }
     this.config = undefined;
+    if (this.collaborationManager) {
+      this.collaborationManager.dispose();
+      this.collaborationManager = new CollaborativeGenerationManager((message) => this.logger(message));
+    }
   }
 }
 
