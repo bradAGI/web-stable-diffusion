@@ -14,6 +14,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Optional
 
+from .modal_generators import (
+    AudioGenerator,
+    DeviceAwareResult,
+    ImageGenerator,
+    VideoGenerator,
+    VolumeGenerator,
+)
+
 
 # ---------------------------------------------------------------------------
 # Ω-Foundations: MetaLogic layers (see custom instructions)
@@ -38,34 +46,6 @@ class MetaLogic:
 # ---------------------------------------------------------------------------
 # Modal components
 # ---------------------------------------------------------------------------
-class Audio1DModule:
-    """1D audio generation placeholder."""
-
-    def generate(self, prompt: str) -> bytes:
-        raise NotImplementedError("Audio synthesis not implemented")
-
-
-class Image2DModule:
-    """2D image generation placeholder."""
-
-    def generate(self, prompt: str, resolution: Optional[int] = 512) -> Any:
-        raise NotImplementedError("Image synthesis not implemented")
-
-
-class Volume3DModule:
-    """3D volumetric placeholder."""
-
-    def generate(self, prompt: str) -> Any:
-        raise NotImplementedError("Volume synthesis not implemented")
-
-
-class Video4DModule:
-    """4D video generation placeholder."""
-
-    def generate(self, prompt: str, fps: int = 60) -> Any:
-        raise NotImplementedError("Video synthesis not implemented")
-
-
 # ---------------------------------------------------------------------------
 # OmniModal engine
 # ---------------------------------------------------------------------------
@@ -80,23 +60,32 @@ class OmniModalMiniturbo:
 
     def __init__(self) -> None:
         self.meta_logic = MetaLogic()
-        self.audio = Audio1DModule()
-        self.image = Image2DModule()
-        self.volume = Volume3DModule()
-        self.video = Video4DModule()
+        self.audio = AudioGenerator()
+        self.image = ImageGenerator()
+        self.volume = VolumeGenerator()
+        self.video = VideoGenerator()
 
     # -- generation stubs -------------------------------------------------
-    def generate_audio(self, prompt: str) -> bytes:
+    def generate_audio(self, prompt: str) -> DeviceAwareResult:
         return self.audio.generate(prompt)
 
-    def generate_image(self, prompt: str, resolution: int = 512) -> Any:
+    def generate_image(self, prompt: str, resolution: int = 512) -> DeviceAwareResult:
         return self.image.generate(prompt, resolution)
 
-    def generate_volume(self, prompt: str) -> Any:
-        return self.volume.generate(prompt)
+    def generate_volume(self, prompt: str, size: Optional[int] = None) -> DeviceAwareResult:
+        size_value = size or 16
+        return self.volume.generate(prompt, size_value)
 
-    def generate_video(self, prompt: str, fps: int = 60) -> Any:
-        return self.video.generate(prompt, fps)
+    def generate_video(
+        self,
+        prompt: str,
+        fps: int = 60,
+        frames: Optional[int] = None,
+        resolution: Optional[int] = None,
+    ) -> DeviceAwareResult:
+        frame_count = frames or 8
+        res_value = resolution or 16
+        return self.video.generate(prompt, frame_count, (res_value, res_value))
 
 
 __all__ = ["OmniModalMiniturbo", "MetaLogic"]
