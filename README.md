@@ -4,7 +4,7 @@ This project brings stable diffusion models onto web browsers. **Everything runs
 
 You are also more than welcomed to checkout [Web LLM](https://github.com/mlc-ai/web-llm) if you are interested in deploying LLM-based chat bots to browser.
 
-> **New:** the library now ships a neuro-symbolic `OmniModalMiniturbo` engine that performs parallel audio, image, video, and volumetric synthesis guided by a lambda-calculus reasoning core.  The implementation is deterministic and lightweight so it can run inside unit tests while still providing real multi-modal outputs.
+> **New:** the library now ships a neuro-symbolic `OmniModalMiniturbo` engine that performs parallel audio, image, video, and volumetric synthesis guided by a lambda-calculus reasoning core.  The implementation remains a deterministic demonstration model designed for fast experimentation rather than photorealistic diffusion—see [docs/omnimodal.md](docs/omnimodal.md) for architecture notes and roadmap.
 
 ### Prototype omni-modal hardware requirements
 
@@ -24,6 +24,21 @@ The symbolic embeddings derived from each prompt drive diffusion-style
 refinement loops that produce small tensors (audio waveforms, configurable
 images, volumetric grids, and temporally coherent video clips).  The deterministic
 pipelines allow tests to validate the outputs quickly on any development machine.
+
+### Running the omni-modal CLI
+
+The reference engine now exposes a first-class CLI so the demo can be invoked
+from automation scripts and manual terminals alike:
+
+```bash
+python -m web_stable_diffusion.cli.omnimodal --prompt "A calm lake at dawn" --output ./artefacts
+```
+
+This command writes NumPy `.npz` payloads and a `manifest.json` describing the
+generated audio, image, volume, and video tensors.  Once the package is
+installed via `pip`, the same functionality is available through the
+`omnimodal-generate` console script.  Because the payloads remain lightweight,
+they can be versioned, inspected, or piped into downstream evaluation tooling.
 
 <img src="site/img/fig/browser-screenshot.png" alt="Browser screenshot"/>
 
