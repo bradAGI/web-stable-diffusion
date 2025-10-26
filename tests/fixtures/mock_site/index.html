@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Mock Stable Diffusion</title>
+    <script>
+      var tvmjsGlobalEnv = tvmjsGlobalEnv || {};
+    </script>
+    <script type="module">
+      import init, { TokenizerWasm } from "./dist/tokenizers-wasm/tokenizers_wasm.js";
+
+      let initialized = false;
+      async function getTokenizer(name) {
+    if (!initialized) {
+      await init();
+      initialized = true;
+    }
+    const response = await fetch(
+      `https://huggingface.co/${name}/raw/main/tokenizer.json`
+    );
+    const jsonText = await response.text();
+    return new TokenizerWasm(jsonText);
+  }
+
+  const globalEnv = window.tvmjsGlobalEnv || {};
+  window.tvmjsGlobalEnv = globalEnv;
+  globalEnv.getTokenizer = getTokenizer;
+  window.__tokenizerReady = true;
+    </script>
+    <script src="dist/stable_diffusion.js"></script>
+  </head>
+  <body>
+    <div>
+      Select Model:
+      <select name="model" id="modelId">
+        <option selected="selected">Stable-Diffusion-XL</option>
+        <option>Stable-Diffusion-1.5</option>
+      </select>
+    </div>
+    <div>
+      Input prompt:
+      <input
+        name="inputPrompt"
+        id="inputPrompt"
+        type="text"
+        value="A photo of an astronaut riding a horse on mars"
+      />
+      <br />
+      Negative prompt (optional):
+      <input name="negativePrompt" id="negativePrompt" type="text" value="" />
+    </div>
+    <div>
+      Select scheduler -
+      <select name="scheduler" id="schedulerId">
+        <option value="0">Multi-step DPM Solver (20 steps)</option>
+        <option value="1">PNDM (50 steps)</option>
+        <option value="2">Euler Discrete Scheduler</option>
+      </select>
+      <br />
+      Render intermediate steps -
+      <select name="vae-cycle" id="vaeCycle">
+        <option value="-1">No</option>
+        <option value="2">Run VAE every two UNet steps after step 10</option>
+      </select>
+    </div>
+    <div id="progress">
+      <label id="gpu-tracker-label"></label><br />
+      <label id="progress-tracker-label"></label><br />
+      <progress id="progress-tracker-progress" max="100" value="0"></progress>
+    </div>
+    <button id="generate">Generate</button>
+    <canvas id="canvas" width="512" height="512"></canvas>
+    <div id="log"></div>
+  </body>
+</html>
