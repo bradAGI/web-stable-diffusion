@@ -345,11 +345,10 @@ class CrossAttention(nn.Module):
         key = self.reshape_heads_to_batch_dim(key)
         value = self.reshape_heads_to_batch_dim(value)
 
-        # TODO(PVP) - mask is currently never used. Remember to re-implement when used
+        attention_mask = self._prepare_attention_mask(mask, batch_size, sequence_length, key.shape[1], query.dtype, query.device)
 
-        # attention, what we cannot get enough of
         if self._slice_size is None or query.shape[0] // self._slice_size == 1:
-            hidden_states = self._attention(query, key, value)
+            hidden_states = self._attention(query, key, value, attention_mask)
         else:
             hidden_states = self._sliced_attention(
                 query, key, value, sequence_length, dim
@@ -357,11 +356,67 @@ class CrossAttention(nn.Module):
 
         return self.to_out(hidden_states)
 
-    def _attention(self, query, key, value):
-        # TODO: use baddbmm for better performance
-        attention_scores = torch.matmul(query, key.transpose(-1, -2)) * self.scale
+    def _prepare_attention_mask(self, mask, batch_size, query_length, key_length, dtype, device):
+        if mask is None:
+            return None
+
+        if mask.dim() == 1:
+            mask = mask.view(batch_size, 1, key_length)
+        elif mask.dim() == 2:
+            mask = mask.unsqueeze(1)
+        elif mask.dim() != 3:
+            raise ValueError(f"Unsupported mask dimension: {mask.dim()}")
+
+        if mask.shape[0] == batch_size:
+            mask = mask.repeat_interleave(self.heads, dim=0)
+        elif mask.shape[0] != batch_size * self.heads:
+            raise ValueError(
+                "Mask batch dimension must equal batch size or batch size multiplied by the number of heads."
+            )
+
+        if mask.shape[1] == 1 and query_length != 1:
+            mask = mask.expand(-1, query_length, -1)
+        elif mask.shape[1] not in (1, query_length):
+            raise ValueError("Mask query dimension must broadcast to the sequence length.")
+
+        if mask.shape[-1] < key_length:
+            pad = key_length - mask.shape[-1]
+            mask = F.pad(mask, (0, pad), value=0.0)
+        elif mask.shape[-1] > key_length:
+            mask = mask[..., :key_length]
+
+        if mask.dtype == torch.bool:
+            additive_mask = torch.zeros_like(mask, dtype=dtype, device=device)
+            additive_mask.masked_fill_(~mask, torch.finfo(dtype).min)
+            mask = additive_mask
+        else:
+            mask = mask.to(dtype=dtype)
+            unique_values = mask.unique()
+            if unique_values.numel() <= 2 and torch.all((unique_values == 0) | (unique_values == 1)):
+                additive_mask = torch.zeros_like(mask, dtype=dtype, device=device)
+                additive_mask.masked_fill_(mask < 0.5, torch.finfo(dtype).min)
+                mask = additive_mask
+
+        return mask
+
+    def _attention(self, query, key, value, mask=None):
+        if mask is None:
+            baddbmm_input = torch.empty(
+                query.shape[0], query.shape[1], key.shape[1], dtype=query.dtype, device=query.device
+            )
+            beta = 0
+        else:
+            baddbmm_input = mask
+            beta = 1
+
+        attention_scores = torch.baddbmm(
+            baddbmm_input,
+            query,
+            key.transpose(-1, -2),
+            beta=beta,
+            alpha=self.scale,
+        )
         attention_probs = attention_scores.softmax(dim=-1)
-        # compute attention output
         hidden_states = torch.matmul(attention_probs, value)
         # reshape hidden_states
         hidden_states = self.reshape_batch_dim_to_heads(hidden_states)

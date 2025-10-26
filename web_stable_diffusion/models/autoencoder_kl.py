@@ -17,10 +17,6 @@ from typing import Dict, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 
-# from ..utils import BaseOutput, apply_forward_hook
-# from .attention_processor import AttentionProcessor, AttnProcessor
-# TODO: check this
-# from .vae import Decoder, DecoderOutput, DiagonalGaussianDistribution, Encoder
 from .vae import Decoder, DiagonalGaussianDistribution, Encoder
 
 

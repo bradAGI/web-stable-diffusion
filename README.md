@@ -6,6 +6,25 @@ You are also more than welcomed to checkout [Web LLM](https://github.com/mlc-ai/
 
 > **New:** the library now exposes an experimental `OmniModalMiniturbo` skeleton that sketches a 1D/2D/3D/4D diffusion interface.  The module is a placeholder for future research toward an audio‑visual, physics‑aware pipeline and does not provide real 4K@60 FPS generation.
 
+### Prototype omni-modal hardware requirements
+
+The deterministic regression generators that back the `OmniModalMiniturbo`
+API automatically select among the available execution backends:
+
+* **PyTorch (CPU/GPU):** preferred when PyTorch is installed.  CUDA will be
+  used when a compatible GPU is present, otherwise the CPU backend is chosen.
+* **TVM Unity runtime:** used when PyTorch is unavailable but TVM is installed
+  locally.  The reference tensors are wrapped in `tvm.nd.array` containers.
+* **WebGPU emulation:** if the Python environment exposes `wgpu` bindings, the
+  generators report a WebGPU backend while returning NumPy buffers that mimic
+  shader outputs.
+* **Pure NumPy fallback:** provides deterministic CPU execution when none of
+  the above runtimes are available.
+
+The prototype modules produce small tensors (audio waveforms, 32×32 images,
+16³ volumes and 16×16×8 video clips) so that unit tests can validate the
+outputs quickly on any development machine.
+
 <img src="site/img/fig/browser-screenshot.png" alt="Browser screenshot"/>
 
 We have been seeing amazing progress through AI models recently. Thanks to the open-source effort, developers can now easily compose open-source models together to produce amazing tasks. Stable diffusion enables the automatic creation of photorealistic images as well as images in various styles based on text input. These models are usually big and compute-heavy, which means we have to pipe through all computation requests to (GPU) servers when developing web applications based on these models. Additionally, most of the workloads have to run on a specific type of GPUs where popular deep-learning frameworks are readily available.
@@ -57,42 +76,40 @@ If you want to go through these steps in command line, please follow the command
     <details><summary>Instructions</summary>
 
     First, let’s install all the prerequisite:
-    1. [emscripten](https://emscripten.org). It is an LLVM-based compiler which compiles C/C++ source code to WebAssembly.
-        - Follow the [installation instruction](https://emscripten.org/docs/getting_started/downloads.html#installation-instructions-using-the-emsdk-recommended) to install the latest emsdk.
-        - Source `emsdk_env.sh` by `source path/to/emsdk_env.sh`, so that `emcc` is reachable from PATH and the command `emcc` works.
-    2. [Rust](https://www.rust-lang.org/tools/install).
-    3. [`wasm-pack`](https://rustwasm.github.io/wasm-pack/installer/). It helps build Rust-generated WebAssembly, which used for tokenizer in our case here.
-    4. Install jekyll by following the [official guides](https://jekyllrb.com/docs/installation/). It is the package we use for website.
-    5. Install jekyll-remote-theme by command
-        ```shell
-        gem install jekyll-remote-theme
-        ```
-    6. Install [Chrome Canary](https://www.google.com/chrome/canary/). It is a developer version of Chrome that enables the use of WebGPU.
+    1. Provision the build toolchain (Emscripten, Rust, `wasm-pack`, Jekyll). The easiest options are
+        - Build the Docker image in [`docker/Dockerfile.toolchain`](docker/Dockerfile.toolchain) or
+        - Create the Conda environment in [`environments/toolchain.yml`](environments/toolchain.yml).
+      Both workflows are documented in [docs/deployment.md](docs/deployment.md). Manual installation is also possible—ensure `emcc`, `cargo`, `wasm-pack`, `npm`, and `jekyll` resolve on your `PATH`.
+    2. Install [Chrome Canary](https://www.google.com/chrome/canary/). It is a developer version of Chrome that enables the use of WebGPU.
 
     We can verify the success installation by trying out `emcc`, `jekyll` and `wasm-pack` in terminal respectively.
 
     Then, prepare all the necessary dependencies for web build:
     ```shell
-    ./scripts/prep_deps.sh
+    make deps
     ```
 
     We can now build the model to WebGPU backend and export the executable to disk in the WebAssembly file format, by running
     ```shell
-    python3 build.py --target webgpu
+    make webgpu
     ```
 
     The last thing to do is setting up the site with
     ```shell
-    ./scripts/local_deploy_site.sh
+    make serve
     ```
 
-    With the site set up, you can go to `localhost:8888/` in Chrome Canary to try out the demo on your local machine. Don’t forget to use
+    To build the static site without launching Jekyll you can run `make site CONFIG=web/gh-page-config.json` and serve the files from `site/dist/`.
+
+    With the site set up, you can go to `localhost:8889/` in Chrome Canary to try out the demo on your local machine. Don’t forget to use
     ```shell
     /Applications/Google\ Chrome\ Canary.app/Contents/MacOS/Google\ Chrome\ Canary --enable-dawn-features=disable_robustness
     ```
     to launch Chrome Canary to turn off the robustness check from Chrome.
-    </details>
 </details>
+</details>
+
+For production deployment guidance, including CI/CD templates, Docker environments, and health-check strategies, see [docs/deployment.md](docs/deployment.md).
 
 ## How?
 

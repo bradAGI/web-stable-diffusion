@@ -1,3 +1,33 @@
+function callUIHook(name, ...args) {
+  try {
+    if (typeof tvmjsGlobalEnv !== "undefined") {
+      const fn = tvmjsGlobalEnv[name];
+      if (typeof fn === "function") {
+        return fn(...args);
+      }
+    }
+  } catch (err) {
+    console.warn("UI hook execution error", name, err);
+  }
+  return undefined;
+}
+
+function setElementText(id, text) {
+  if (typeof document === "undefined") return;
+  const el = document.getElementById(id);
+  if (el !== null && el !== undefined) {
+    el.innerHTML = text;
+  }
+}
+
+function setProgressValue(id, value) {
+  if (typeof document === "undefined") return;
+  const el = document.getElementById(id);
+  if (el !== null && el !== undefined) {
+    el.value = value;
+  }
+}
+
 /**
  * Lightweight wrapper that converts TVM NDArrays to transferable payloads.
  * The helper prefers GPU backed buffers but falls back to CPU typed arrays
@@ -1281,6 +1311,7 @@ class StableDiffusionInstance {
     this.pipeline = undefined;
     this.config = undefined;
     this.generateInProgress = false;
+    this.requestInProgress = false;
     this.logger = console.log;
     this.collaborationManager = new CollaborativeGenerationManager((message) => this.logger(message));
     this.model = "Stable-Diffusion-XL"
@@ -1296,17 +1327,16 @@ class StableDiffusionInstance {
       return;
     }
 
-    if (document.getElementById("log") !== undefined) {
-      this.logger = function (message) {
-        console.log(message);
+    const logContainer = (typeof document !== "undefined") ? document.getElementById("log") : undefined;
+    this.logger = (message) => {
+      console.log(message);
+      const handled = callUIHook("logMessage", message);
+      if (handled === undefined && logContainer !== undefined && logContainer !== null) {
         const d = document.createElement("div");
         d.innerHTML = message;
-        document.getElementById("log").appendChild(d);
-      };
-      if (this.collaborationManager) {
-        this.collaborationManager.logger = this.logger;
+        logContainer.appendChild(d);
       }
-    }
+    };
 
     const wasmSource = await (
       await fetch(wasmUrl)
@@ -1326,19 +1356,24 @@ class StableDiffusionInstance {
         } else {
           label += " - " + output.adapterInfo.vendor;
         }
-        document.getElementById(
-          "gpu-tracker-label").innerHTML = ("Initialize GPU device: " + label);
+        const status = "Initialize GPU device: " + label;
+        if (callUIHook("updateGpuStatus", status) === undefined) {
+          setElementText("gpu-tracker-label", status);
+        }
         tvm.initWebGPU(output.device);
       } else {
-        document.getElementById(
-          "gpu-tracker-label").innerHTML = "This browser env do not support WebGPU";
+        const status = "This browser env do not support WebGPU";
+        if (callUIHook("updateGpuStatus", status) === undefined) {
+          setElementText("gpu-tracker-label", status);
+        }
         this.reset();
         throw Error("This browser env do not support WebGPU");
       }
     } catch (err) {
-      document.getElementById("gpu-tracker-label").innerHTML = (
-        "Find an error initializing the WebGPU device " + err.toString()
-      );
+      const status = "Find an error initializing the WebGPU device " + err.toString();
+      if (callUIHook("updateGpuStatus", status) === undefined) {
+        setElementText("gpu-tracker-label", status);
+      }
       console.log(err.stack);
       this.reset();
       throw Error("Find an error initializing WebGPU: " + err.toString());
@@ -1346,8 +1381,11 @@ class StableDiffusionInstance {
 
     this.tvm = tvm;
     function initProgressCallback(report) {
-      document.getElementById("progress-tracker-label").innerHTML = report.text;
-      document.getElementById("progress-tracker-progress").value = report.progress * 100;
+      const handled = callUIHook("updateProgress", report);
+      if (handled === undefined) {
+        setElementText("progress-tracker-label", report.text);
+        setProgressValue("progress-tracker-progress", report.progress * 100);
+      }
     }
     tvm.registerInitProgressCallback(initProgressCallback);
     if (!cacheUrl.startsWith("http")) {
@@ -1413,6 +1451,77 @@ class StableDiffusionInstance {
     this.config.cacheUrl = model_param_url;
   }
 
+  #getInputValue(elementId) {
+    if (typeof document === "undefined") {
+      return "";
+    }
+    const el = document.getElementById(elementId);
+    if (el === null || el === undefined) {
+      return "";
+    }
+    return el.value;
+  }
+
+  #reportValidationError(field, message) {
+    callUIHook("reportValidationError", { field: field, message: message });
+    this.logger(message);
+  }
+
+  #validatePrompt(prompt) {
+    if (prompt === undefined || prompt === null || prompt.trim().length === 0) {
+      const error = new Error("Prompt cannot be empty.");
+      error.validation = true;
+      this.#reportValidationError("prompt", "Prompt cannot be empty.");
+      throw error;
+    }
+    if (prompt.length > 1000) {
+      const error = new Error("Prompt too long.");
+      error.validation = true;
+      this.#reportValidationError("prompt", "Prompt is limited to 1000 characters.");
+      throw error;
+    }
+    return prompt;
+  }
+
+  #validateNegativePrompt(prompt) {
+    if (prompt !== undefined && prompt !== null && prompt.length > 1000) {
+      const error = new Error("Negative prompt too long.");
+      error.validation = true;
+      this.#reportValidationError("negativePrompt", "Negative prompt is limited to 1000 characters.");
+      throw error;
+    }
+    return prompt ?? "";
+  }
+
+  #resolveSchedulerId(schedulerId) {
+    const schedulerSupport = {
+      "Stable-Diffusion-XL": ["2"],
+      "Stable-Diffusion-1.5": ["0", "1"],
+    };
+    const supported = schedulerSupport[this.model] ?? ["0"];
+    if (supported.includes(schedulerId)) {
+      return schedulerId;
+    }
+    const fallback = supported.length > 0 ? supported[0] : schedulerId ?? "0";
+    const payload = {
+      previous: schedulerId,
+      fallback: fallback,
+      model: this.model,
+    };
+    callUIHook("onSchedulerFallback", payload);
+    this.logger(
+      "Scheduler " + schedulerId + " not valid for model " + this.model + ", falling back to " + fallback
+    );
+    callUIHook("setSchedulerId", fallback);
+    if (typeof document !== "undefined") {
+      const select = document.getElementById("schedulerId");
+      if (select !== null && select !== undefined) {
+        select.value = fallback;
+      }
+    }
+    return fallback;
+  }
+
   /**
    * Function to create progress callback tracker.
    * @returns A progress callback tracker.
@@ -1430,8 +1539,19 @@ class StableDiffusionInstance {
         counter = totalNumSteps;
       }
       text += ", " + Math.ceil(timeElapsed) + " secs elapsed.";
-      document.getElementById("progress-tracker-label").innerHTML = text;
-      document.getElementById("progress-tracker-progress").value = (counter / totalNumSteps) * 100;
+      const report = {
+        text: text,
+        progress: counter / totalNumSteps,
+        stage: stage,
+        counter: counter,
+        numSteps: numSteps,
+        totalNumSteps: totalNumSteps,
+      };
+      const handled = callUIHook("updateProgress", report);
+      if (handled === undefined) {
+        setElementText("progress-tracker-label", text);
+        setProgressValue("progress-tracker-progress", (counter / totalNumSteps) * 100);
+      }
     }
     return progressCallback;
   }
@@ -1485,10 +1605,18 @@ class StableDiffusionInstance {
 
     this.tvm.beginScope();
     this.tvm.registerAsyncServerFunc("generate", async (prompt, schedulerId, vaeCycle) => {
-      document.getElementById("inputPrompt").value = prompt;
-      const negPrompt = "";
-      document.getElementById("negativePrompt").value = "";
-      await this.pipeline.generate(prompt, negPrompt, this.#getProgressCallback(), schedulerId, vaeCycle);
+      callUIHook("setPrompts", { prompt: prompt, negativePrompt: "" });
+      if (typeof document !== "undefined") {
+        const promptEl = document.getElementById("inputPrompt");
+        if (promptEl !== null && promptEl !== undefined) {
+          promptEl.value = prompt;
+        }
+        const negPromptEl = document.getElementById("negativePrompt");
+        if (negPromptEl !== null && negPromptEl !== undefined) {
+          negPromptEl.value = "";
+        }
+      }
+      await this.pipeline.generate(prompt, "", this.#getProgressCallback(), schedulerId, vaeCycle);
     });
     this.tvm.registerAsyncServerFunc("clearCanvas", async () => {
       this.tvm.clearCanvas();
@@ -1508,19 +1636,41 @@ class StableDiffusionInstance {
       return;
     }
     this.requestInProgress = true;
+    callUIHook("onGenerationLifecycle", "start");
+    callUIHook("clearValidationErrors");
     try {
       await this.asyncInit();
-      const prompt = document.getElementById("inputPrompt").value;
-      const negPrompt = document.getElementById("negativePrompt").value;
-      const schedulerId = document.getElementById("schedulerId").value;
-      const vaeCycle = document.getElementById("vaeCycle").value;
+      const promptCandidate = callUIHook("getPrompt");
+      const negPromptCandidate = callUIHook("getNegativePrompt");
+      const schedulerCandidate = callUIHook("getSchedulerId");
+      const vaeCandidate = callUIHook("getVaeCycle");
+      const prompt = this.#validatePrompt(
+        promptCandidate !== undefined ? promptCandidate : this.#getInputValue("inputPrompt")
+      );
+      const negPrompt = this.#validateNegativePrompt(
+        negPromptCandidate !== undefined ? negPromptCandidate : this.#getInputValue("negativePrompt")
+      );
+      const schedulerId = this.#resolveSchedulerId(
+        schedulerCandidate !== undefined ? schedulerCandidate : this.#getInputValue("schedulerId")
+      );
+      const vaeCycle =
+        vaeCandidate !== undefined ? vaeCandidate : this.#getInputValue("vaeCycle");
       await this.pipeline.generate(prompt, negPrompt, this.#getProgressCallback(), schedulerId, vaeCycle);
+      callUIHook("onGenerationLifecycle", "complete");
     } catch (err) {
-      this.logger("Generate error, " + err.toString());
-      console.log(err.stack);
-      this.reset();
+      if (!(err !== undefined && err !== null && err.validation === true)) {
+        this.logger("Generate error, " + err.toString());
+        if (err !== undefined && err !== null && err.stack !== undefined) {
+          console.log(err.stack);
+        }
+        this.reset();
+        callUIHook("onGenerationLifecycle", "error");
+      } else {
+        callUIHook("onGenerationLifecycle", "validation-error");
+      }
     }
     this.requestInProgress = false;
+    callUIHook("onGenerationLifecycle", "end");
   }
 
   /**
@@ -1555,13 +1705,26 @@ tvmjsGlobalEnv.asyncOnRPCServerLoad = async function (tvm) {
 };
 
 function handle_model_change() {
-  var e = document.getElementById("modelId");
-  function onChange() {
+  function notifyModelChange(value) {
+    if (value === undefined) {
+      return;
+    }
     localStableDiffusionInst.reset();
-    localStableDiffusionInst.model = e.value;
-    localStableDiffusionInst.logger("model changed to " + e.value)
+    localStableDiffusionInst.model = value;
+    localStableDiffusionInst.logger("model changed to " + value);
   }
-  e.onchange = onChange;
+  if (typeof tvmjsGlobalEnv !== "undefined") {
+    tvmjsGlobalEnv.notifyModelSelection = notifyModelChange;
+  }
+  notifyModelChange(localStableDiffusionInst.model);
+  if (typeof document !== "undefined") {
+    const e = document.getElementById("modelId");
+    if (e !== null && e !== undefined) {
+      e.onchange = function () {
+        notifyModelChange(e.value);
+      };
+    }
+  }
 }
 
-handle_model_change()
+handle_model_change();
