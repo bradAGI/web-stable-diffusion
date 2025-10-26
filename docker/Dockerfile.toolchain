@@ -1,0 +1,40 @@
+# syntax=docker/dockerfile:1.4
+FROM ubuntu:22.04
+
+SHELL ["/bin/bash", "-lc"]
+
+ARG DEBIAN_FRONTEND=noninteractive
+ARG EMSDK_VERSION=3.1.45
+ARG RUST_VERSION=1.75.0
+ARG WASM_PACK_VERSION=0.12.1
+
+RUN apt-get update && apt-get install -y --no-install-recommends     build-essential     ca-certificates     cmake     curl     git     python3     python3-pip     python3-venv     ruby-full     unzip     nodejs     npm     pkg-config     libssl-dev     && rm -rf /var/lib/apt/lists/*
+
+# Install emscripten SDK
+RUN git clone https://github.com/emscripten-core/emsdk.git /opt/emsdk     && cd /opt/emsdk     && ./emsdk install ${EMSDK_VERSION}     && ./emsdk activate ${EMSDK_VERSION}
+
+RUN echo "source /opt/emsdk/emsdk_env.sh" >> /etc/profile.d/emsdk.sh
+ENV EMSDK=/opt/emsdk     EMSDK_VERSION=${EMSDK_VERSION}
+ENV PATH="/opt/emsdk:/opt/emsdk/upstream/emscripten:${PATH}"
+
+# Install rust toolchain
+RUN curl https://sh.rustup.rs -sSf | sh -s -- -y --default-toolchain ${RUST_VERSION} --profile minimal     && /root/.cargo/bin/rustup target add wasm32-unknown-unknown
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# Install wasm-pack
+RUN cargo install wasm-pack --version ${WASM_PACK_VERSION}
+
+# Install Jekyll and theme dependencies
+RUN gem install bundler jekyll jekyll-remote-theme
+
+WORKDIR /workspace
+COPY requirements.txt ./
+
+RUN source /opt/emsdk/emsdk_env.sh     && python3 -m pip install --no-cache-dir --upgrade pip     && python3 -m pip install --no-cache-dir -r requirements.txt     && python3 -m pip install --no-cache-dir mlc-ai-nightly -f https://mlc.ai/wheels
+
+COPY . .
+
+# Pre-download wasm tokenizer and runtime artifacts (optional)
+RUN source /opt/emsdk/emsdk_env.sh && ./scripts/prep_deps.sh
+
+CMD ["/bin/bash"]

@@ -57,42 +57,40 @@ If you want to go through these steps in command line, please follow the command
     <details><summary>Instructions</summary>
 
     First, let’s install all the prerequisite:
-    1. [emscripten](https://emscripten.org). It is an LLVM-based compiler which compiles C/C++ source code to WebAssembly.
-        - Follow the [installation instruction](https://emscripten.org/docs/getting_started/downloads.html#installation-instructions-using-the-emsdk-recommended) to install the latest emsdk.
-        - Source `emsdk_env.sh` by `source path/to/emsdk_env.sh`, so that `emcc` is reachable from PATH and the command `emcc` works.
-    2. [Rust](https://www.rust-lang.org/tools/install).
-    3. [`wasm-pack`](https://rustwasm.github.io/wasm-pack/installer/). It helps build Rust-generated WebAssembly, which used for tokenizer in our case here.
-    4. Install jekyll by following the [official guides](https://jekyllrb.com/docs/installation/). It is the package we use for website.
-    5. Install jekyll-remote-theme by command
-        ```shell
-        gem install jekyll-remote-theme
-        ```
-    6. Install [Chrome Canary](https://www.google.com/chrome/canary/). It is a developer version of Chrome that enables the use of WebGPU.
+    1. Provision the build toolchain (Emscripten, Rust, `wasm-pack`, Jekyll). The easiest options are
+        - Build the Docker image in [`docker/Dockerfile.toolchain`](docker/Dockerfile.toolchain) or
+        - Create the Conda environment in [`environments/toolchain.yml`](environments/toolchain.yml).
+      Both workflows are documented in [docs/deployment.md](docs/deployment.md). Manual installation is also possible—ensure `emcc`, `cargo`, `wasm-pack`, `npm`, and `jekyll` resolve on your `PATH`.
+    2. Install [Chrome Canary](https://www.google.com/chrome/canary/). It is a developer version of Chrome that enables the use of WebGPU.
 
     We can verify the success installation by trying out `emcc`, `jekyll` and `wasm-pack` in terminal respectively.
 
     Then, prepare all the necessary dependencies for web build:
     ```shell
-    ./scripts/prep_deps.sh
+    make deps
     ```
 
     We can now build the model to WebGPU backend and export the executable to disk in the WebAssembly file format, by running
     ```shell
-    python3 build.py --target webgpu
+    make webgpu
     ```
 
     The last thing to do is setting up the site with
     ```shell
-    ./scripts/local_deploy_site.sh
+    make serve
     ```
 
-    With the site set up, you can go to `localhost:8888/` in Chrome Canary to try out the demo on your local machine. Don’t forget to use
+    To build the static site without launching Jekyll you can run `make site CONFIG=web/gh-page-config.json` and serve the files from `site/dist/`.
+
+    With the site set up, you can go to `localhost:8889/` in Chrome Canary to try out the demo on your local machine. Don’t forget to use
     ```shell
     /Applications/Google\ Chrome\ Canary.app/Contents/MacOS/Google\ Chrome\ Canary --enable-dawn-features=disable_robustness
     ```
     to launch Chrome Canary to turn off the robustness check from Chrome.
-    </details>
 </details>
+</details>
+
+For production deployment guidance, including CI/CD templates, Docker environments, and health-check strategies, see [docs/deployment.md](docs/deployment.md).
 
 ## How?
 

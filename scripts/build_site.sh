@@ -6,7 +6,7 @@ if [[ ! -f $1 ]]; then
 fi
 
 rm -rf site/dist
-mkdir -p site/dist site/_inlcudes
+mkdir -p site/dist site/_includes
 
 echo "Copy local configurations.."
 cp $1 site/stable-diffusion-config.json
