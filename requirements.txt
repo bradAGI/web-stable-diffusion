@@ -6,3 +6,5 @@ tvm==0.15.0
 tqdm==4.66.2
 Pillow==10.2.0
 numpy==1.26.4
+fastapi==0.110.0
+uvicorn[standard]==0.27.1
