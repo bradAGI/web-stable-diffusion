@@ -24,7 +24,7 @@ import multiprocessing
 import time
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Set, Tuple, Union
+from typing import Any, Dict, Iterable, Iterator, List, Mapping, MutableMapping, Optional, Sequence, Set, Tuple, Union
 
 import numpy as np
 
@@ -414,6 +414,111 @@ class OmniModalMiniturbo:
         return _pack_array(video, self.device_spec, metadata)
 
     # -- Parallel orchestration -------------------------------------------
+    def generate_bundle_iter(
+        self,
+        prompt: str,
+        *,
+        resolution: int = 256,
+        frames: int = 16,
+        volume_size: int = 32,
+        audio_length: int = 2048,
+        executor: str | None = None,
+        max_workers: Optional[int] = None,
+        timeout: Optional[float] = None,
+    ) -> Iterator[BundleEvent]:
+        """Yield :class:`BundleEvent` instances as modalities finish.
+
+        The generator mirrors :meth:`generate_bundle` but exposes intermediate
+        progress so that callers can provide responsive UI updates.  All
+        parameters follow the same validation rules as the non-streaming
+        variant.  A ``TimeoutError`` is raised if the deadline is exceeded.
+        """
+
+        prompt = self._ensure_prompt(prompt)
+        resolution = self._ensure_positive(resolution, "resolution", minimum=16)
+        frames = self._ensure_positive(frames, "frames")
+        volume_size = self._ensure_positive(volume_size, "volume_size", minimum=8)
+        audio_length = self._ensure_positive(audio_length, "audio_length")
+
+        exec_mode = (executor or "auto").lower()
+        if exec_mode not in {"auto", "thread", "process"}:
+            raise ValueError("executor must be 'auto', 'thread' or 'process'")
+
+        tasks = {
+            "audio": (self.generate_audio, {"prompt": prompt, "length": audio_length}),
+            "image": (self.generate_image, {"prompt": prompt, "resolution": resolution}),
+            "volume": (self.generate_volume, {"prompt": prompt, "size": volume_size}),
+            "video": (
+                self.generate_video,
+                {"prompt": prompt, "frames": frames, "resolution": max(16, resolution // 2)},
+            ),
+        }
+
+        worker_count = max_workers or len(tasks)
+        deadline = time.perf_counter() + timeout if timeout is not None else None
+
+        def remaining_timeout() -> Optional[float]:
+            if deadline is None:
+                return None
+            remaining = deadline - time.perf_counter()
+            if remaining <= 0:
+                raise TimeoutError("bundle generation timed out before completion")
+            return remaining
+
+        should_use_process = (
+            exec_mode == "process"
+            or (exec_mode == "auto" and self.device_spec.backend == BACKEND_NUMPY)
+        ) and self.device_spec.backend == BACKEND_NUMPY
+
+        if should_use_process:
+            ctx = multiprocessing.get_context("spawn")
+            executor_cls = concurrent.futures.ProcessPoolExecutor
+            executor_kwargs: Dict[str, Any] = {"max_workers": worker_count, "mp_context": ctx}
+        else:
+            executor_cls = concurrent.futures.ThreadPoolExecutor
+            executor_kwargs = {"max_workers": worker_count}
+
+        total = len(tasks)
+        completed = 0
+
+        with executor_cls(**executor_kwargs) as pool:
+            future_to_key: Dict[concurrent.futures.Future[DeviceAwareResult], Tuple[str, float]] = {}
+            for key, (func, kwargs) in tasks.items():
+                start = time.perf_counter()
+                if should_use_process:
+                    future = pool.submit(
+                        _execute_modality,
+                        key,
+                        kwargs,
+                        self.diffusion_steps,
+                        self.device_spec,
+                    )
+                else:
+                    future = pool.submit(func, **kwargs)
+                future_to_key[future] = (key, start)
+
+            try:
+                for future in concurrent.futures.as_completed(
+                    future_to_key, timeout=remaining_timeout()
+                ):
+                    key, start = future_to_key[future]
+                    duration = time.perf_counter() - start
+                    result = future.result()
+                    result.metadata.setdefault("metrics", {})["wall_clock_s"] = duration
+                    completed += 1
+                    logger.debug("Generated modality %s in %.3fs", key, duration)
+                    yield BundleEvent(
+                        key=key,
+                        result=result,
+                        duration_s=duration,
+                        completed=completed,
+                        total=total,
+                    )
+            except FuturesTimeoutError as exc:
+                for future in future_to_key:
+                    future.cancel()
+                raise TimeoutError("bundle generation timed out before completion") from exc
+
     def generate_bundle(
         self,
         prompt: str,
@@ -453,83 +558,18 @@ class OmniModalMiniturbo:
             exceeded.
         """
 
-        prompt = self._ensure_prompt(prompt)
-        resolution = self._ensure_positive(resolution, "resolution", minimum=16)
-        frames = self._ensure_positive(frames, "frames")
-        volume_size = self._ensure_positive(volume_size, "volume_size", minimum=8)
-        audio_length = self._ensure_positive(audio_length, "audio_length")
-
-        exec_mode = (executor or "auto").lower()
-        if exec_mode not in {"auto", "thread", "process"}:
-            raise ValueError("executor must be 'auto', 'thread' or 'process'")
-
-        tasks = {
-            "audio": (self.generate_audio, {"prompt": prompt, "length": audio_length}),
-            "image": (self.generate_image, {"prompt": prompt, "resolution": resolution}),
-            "volume": (self.generate_volume, {"prompt": prompt, "size": volume_size}),
-            "video": (
-                self.generate_video,
-                {"prompt": prompt, "frames": frames, "resolution": max(16, resolution // 2)},
-            ),
-        }
-
-        worker_count = max_workers or len(tasks)
         results: Dict[str, DeviceAwareResult] = {}
-
-        deadline = time.perf_counter() + timeout if timeout is not None else None
-
-        def remaining_timeout() -> Optional[float]:
-            if deadline is None:
-                return None
-            remaining = deadline - time.perf_counter()
-            if remaining <= 0:
-                raise TimeoutError("bundle generation timed out before completion")
-            return remaining
-
-        should_use_process = (
-            exec_mode == "process"
-            or (exec_mode == "auto" and self.device_spec.backend == BACKEND_NUMPY)
-        ) and self.device_spec.backend == BACKEND_NUMPY
-
-        if should_use_process:
-            ctx = multiprocessing.get_context("spawn")
-            executor_cls = concurrent.futures.ProcessPoolExecutor
-            executor_kwargs: Dict[str, Any] = {"max_workers": worker_count, "mp_context": ctx}
-        else:
-            executor_cls = concurrent.futures.ThreadPoolExecutor
-            executor_kwargs = {"max_workers": worker_count}
-
-        with executor_cls(**executor_kwargs) as pool:
-            future_to_key: Dict[concurrent.futures.Future[DeviceAwareResult], Tuple[str, float]] = {}
-            for key, (func, kwargs) in tasks.items():
-                start = time.perf_counter()
-                if should_use_process:
-                    future = pool.submit(
-                        _execute_modality,
-                        key,
-                        kwargs,
-                        self.diffusion_steps,
-                        self.device_spec,
-                    )
-                else:
-                    future = pool.submit(func, **kwargs)
-                future_to_key[future] = (key, start)
-
-            try:
-                for future in concurrent.futures.as_completed(
-                    future_to_key, timeout=remaining_timeout()
-                ):
-                    key, start = future_to_key[future]
-                    duration = time.perf_counter() - start
-                    result = future.result()
-                    result.metadata.setdefault("metrics", {})["wall_clock_s"] = duration
-                    results[key] = result
-                    logger.debug("Generated modality %s in %.3fs", key, duration)
-            except FuturesTimeoutError as exc:
-                for future in future_to_key:
-                    future.cancel()
-                raise TimeoutError("bundle generation timed out before completion") from exc
-
+        for event in self.generate_bundle_iter(
+            prompt,
+            resolution=resolution,
+            frames=frames,
+            volume_size=volume_size,
+            audio_length=audio_length,
+            executor=executor,
+            max_workers=max_workers,
+            timeout=timeout,
+        ):
+            results[event.key] = event.result
         return results
 
 
@@ -544,7 +584,27 @@ def _execute_modality(
     return generator(**kwargs)
 
 
+@dataclass(frozen=True)
+class BundleEvent:
+    """Represents completion of a single modality within a bundle."""
+
+    key: str
+    result: DeviceAwareResult
+    duration_s: float
+    completed: int
+    total: int
+
+    @property
+    def progress(self) -> float:
+        """Return overall bundle progress in the inclusive range ``[0, 1]``."""
+
+        if self.total <= 0:
+            return 1.0
+        return min(1.0, max(0.0, self.completed / self.total))
+
+
 __all__ = [
+    "BundleEvent",
     "Application",
     "Const",
     "Lambda",

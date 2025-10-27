@@ -50,6 +50,29 @@ Key flags expose production-ready ergonomics:
 * `--log-level` enables structured logging for integration into observability
   stacks.
 
+### Streaming omni-modal API
+
+For interactive scenarios the project now ships a FastAPI service that streams
+JSON Lines events as soon as each modality finishes.  Launch the service with
+
+```bash
+uvicorn web_stable_diffusion.runtime.api:app --reload
+```
+
+and issue a request via `curl` or any HTTP client:
+
+```bash
+curl -N -X POST "http://127.0.0.1:8000/generate" \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "Neon skyline at midnight", "frames": 8}'
+```
+
+Every line in the response is a JSON document describing either a finished
+modality (complete with base64-compressed artefacts and device metadata) or the
+final manifest.  This enables terminals, dashboards, or WebSocket bridges to
+render progress bars, previews, or alerts in real time without waiting for the
+entire bundle to finish.
+
 <img src="site/img/fig/browser-screenshot.png" alt="Browser screenshot"/>
 
 We have been seeing amazing progress through AI models recently. Thanks to the open-source effort, developers can now easily compose open-source models together to produce amazing tasks. Stable diffusion enables the automatic creation of photorealistic images as well as images in various styles based on text input. These models are usually big and compute-heavy, which means we have to pipe through all computation requests to (GPU) servers when developing web applications based on these models. Additionally, most of the workloads have to run on a specific type of GPUs where popular deep-learning frameworks are readily available.
