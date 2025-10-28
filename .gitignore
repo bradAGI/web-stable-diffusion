@@ -1,5 +1,6 @@
 dist/
 params/
+node_modules/
 *.bak
 # Byte-compiled / optimized / DLL files
 __pycache__/
