@@ -111,6 +111,9 @@ def _stream_bundle_events(request: GenerateRequest) -> Iterator[str]:
             },
         },
     }
+    benchmark = engine.last_benchmark
+    if benchmark:
+        manifest["metadata"]["metrics"]["scalability"] = _normalise_metadata(benchmark)
     yield json.dumps({"type": "complete", "manifest": manifest}) + "\n"
 
 
