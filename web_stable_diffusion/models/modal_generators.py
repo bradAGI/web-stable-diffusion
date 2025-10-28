@@ -71,7 +71,9 @@ class DeviceAwareResult:
         if self.backend == BACKEND_TVM:
             # ``numpy()`` exists on tvm.nd.NDArray, but type-checkers do not
             # know about it, so we fall back to ``np.array``.
-            return np.array(self.data.numpy())  # type: ignore[attr-defined]
+            if hasattr(self.data, "numpy"):
+                return np.array(self.data.numpy())  # type: ignore[attr-defined]
+            return np.array(self.data)
         if self.backend == BACKEND_WEBGPU:
             buffer = self.data.get("buffer", self.data) if isinstance(self.data, dict) else self.data
             return np.array(buffer)
@@ -85,6 +87,13 @@ def select_device() -> DeviceSpec:
         device = "cuda" if torch.cuda.is_available() else "cpu"
         return DeviceSpec(BACKEND_TORCH, device)
     if _TVM_AVAILABLE:
+        assert tvm is not None  # for type-checkers
+        try:
+            cuda_device = tvm.cuda()
+            if getattr(cuda_device, "exist", False):
+                return DeviceSpec(BACKEND_TVM, "cuda")
+        except Exception:  # pragma: no cover - optional dependency
+            pass
         return DeviceSpec(BACKEND_TVM, "llvm")
     if _WGPU_AVAILABLE:
         return DeviceSpec(BACKEND_WEBGPU, "wgpu")

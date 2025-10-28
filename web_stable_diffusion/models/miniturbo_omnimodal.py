@@ -18,11 +18,13 @@ from __future__ import annotations
 
 import concurrent.futures
 import hashlib
+import heapq
+import itertools
 import logging
 import math
 import multiprocessing
+import threading
 import time
-from concurrent.futures import TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, Iterator, List, Mapping, MutableMapping, Optional, Sequence, Set, Tuple, Union
 
@@ -45,6 +47,7 @@ except Exception:  # pragma: no cover - optional dependency
     _TVM_AVAILABLE = False
 
 
+from .compiled_decoders import CompiledDecoder, load_compiled_decoders
 from .modal_generators import (
     BACKEND_NUMPY,
     BACKEND_TORCH,
@@ -57,6 +60,124 @@ from .modal_generators import (
 
 
 logger = logging.getLogger(__name__)
+
+
+class GenerationError(RuntimeError):
+    """Base class for structured generation failures."""
+
+    def __init__(self, message: str, *, code: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {"code": self.code, "message": str(self)}
+
+
+class GenerationCancelled(GenerationError):
+    """Raised when a caller-initiated cancellation halts generation."""
+
+    def __init__(self, reason: str | None = None) -> None:
+        super().__init__(reason or "generation cancelled", code="cancelled")
+        self.reason = reason or "cancelled"
+
+    def as_dict(self) -> Dict[str, Any]:
+        payload = super().as_dict()
+        payload["reason"] = self.reason
+        return payload
+
+
+class BudgetExceededError(GenerationError):
+    """Raised when a modality exceeds its configured resource budget."""
+
+    def __init__(
+        self,
+        modality: str,
+        *,
+        metric: str,
+        limit: float,
+        usage: float,
+    ) -> None:
+        message = (
+            f"modality '{modality}' exceeded {metric} budget: "
+            f"{usage:.2f} > {limit:.2f}"
+        )
+        super().__init__(message, code="budget_exceeded")
+        self.modality = modality
+        self.metric = metric
+        self.limit = limit
+        self.usage = usage
+
+    def as_dict(self) -> Dict[str, Any]:
+        payload = super().as_dict()
+        payload.update(
+            {
+                "modality": self.modality,
+                "metric": self.metric,
+                "limit": self.limit,
+                "usage": self.usage,
+            }
+        )
+        return payload
+
+
+@dataclass(frozen=True)
+class ResourceBudget:
+    """Simple resource budget expressed as memory and CPU constraints."""
+
+    max_memory_bytes: Optional[int] = None
+    max_cpu_seconds: Optional[float] = None
+
+    def check(self, modality: str, *, memory: Optional[int], cpu: Optional[float]) -> None:
+        if self.max_memory_bytes is not None and memory is not None:
+            if memory > self.max_memory_bytes:
+                raise BudgetExceededError(
+                    modality,
+                    metric="memory_bytes",
+                    limit=float(self.max_memory_bytes),
+                    usage=float(memory),
+                )
+        if self.max_cpu_seconds is not None and cpu is not None:
+            if cpu > self.max_cpu_seconds:
+                raise BudgetExceededError(
+                    modality,
+                    metric="cpu_seconds",
+                    limit=float(self.max_cpu_seconds),
+                    usage=float(cpu),
+                )
+
+
+class CancellationToken:
+    """Thread-safe cancellation primitive shared across modalities."""
+
+    def __init__(self) -> None:
+        self._event = threading.Event()
+        self._reason: Optional[str] = None
+
+    def cancel(self, reason: Optional[str] = None) -> None:
+        if reason is not None:
+            self._reason = reason
+        self._event.set()
+
+    @property
+    def cancelled(self) -> bool:
+        return self._event.is_set()
+
+    @property
+    def reason(self) -> Optional[str]:
+        return self._reason
+
+    def raise_if_cancelled(self) -> None:
+        if self.cancelled:
+            raise GenerationCancelled(self._reason)
+
+
+DEFAULT_RESOURCE_BUDGETS: Mapping[str, ResourceBudget] = {
+    "audio": ResourceBudget(max_memory_bytes=32 * 1024 * 1024, max_cpu_seconds=15.0),
+    "image": ResourceBudget(max_memory_bytes=48 * 1024 * 1024, max_cpu_seconds=20.0),
+    "volume": ResourceBudget(max_memory_bytes=96 * 1024 * 1024, max_cpu_seconds=25.0),
+    "video": ResourceBudget(max_memory_bytes=256 * 1024 * 1024, max_cpu_seconds=30.0),
+    "default": ResourceBudget(max_memory_bytes=256 * 1024 * 1024, max_cpu_seconds=30.0),
+}
 
 
 # ---------------------------------------------------------------------------
@@ -247,6 +368,24 @@ def _normalise(array: np.ndarray) -> np.ndarray:
     return ((array - min_val) / (max_val - min_val)).astype(np.float32)
 
 
+def _estimate_payload_size(result: DeviceAwareResult) -> int:
+    metadata = result.metadata
+    dtype_name = metadata.get("dtype") if isinstance(metadata, dict) else None
+    shape = metadata.get("shape") if isinstance(metadata, dict) else None
+    if dtype_name is not None and shape is not None:
+        try:
+            dtype = np.dtype(dtype_name)
+            size = int(np.prod(shape))
+            return int(size * dtype.itemsize)
+        except Exception:  # pragma: no cover - defensive
+            pass
+    array = result.to_numpy()
+    if isinstance(metadata, dict):
+        metadata.setdefault("dtype", str(array.dtype))
+        metadata.setdefault("shape", list(array.shape))
+    return int(array.nbytes)
+
+
 class OmniModalMiniturbo:
     """High level omni-modal synthesis engine with neuro-symbolic guidance."""
 
@@ -255,10 +394,17 @@ class OmniModalMiniturbo:
         *,
         diffusion_steps: int = 6,
         device_spec: DeviceSpec | None = None,
+        resource_budgets: Optional[Mapping[str, ResourceBudget]] = None,
     ) -> None:
         self.meta_logic = MetaLogic()
         self.device_spec = device_spec or select_device()
         self.diffusion_steps = diffusion_steps
+        base_budgets = dict(DEFAULT_RESOURCE_BUDGETS)
+        if resource_budgets:
+            base_budgets.update(resource_budgets)
+        self.resource_budgets: Dict[str, ResourceBudget] = base_budgets
+        self._last_benchmark: Dict[str, Any] | None = None
+        self._decoders: Dict[str, CompiledDecoder] = load_compiled_decoders(self.device_spec)
 
     # -- Validation helpers -----------------------------------------------
     @staticmethod
@@ -277,6 +423,19 @@ class OmniModalMiniturbo:
         if not prompt:
             raise ValueError("prompt cannot be empty")
         return prompt
+
+    def _resolve_budget(
+        self,
+        modality: str,
+        overrides: Optional[Mapping[str, ResourceBudget]] = None,
+    ) -> Optional[ResourceBudget]:
+        if overrides and modality in overrides:
+            return overrides[modality]
+        if overrides and "default" in overrides:
+            return overrides["default"]
+        if modality in self.resource_budgets:
+            return self.resource_budgets[modality]
+        return self.resource_budgets.get("default")
 
     # -- Prompt processing -------------------------------------------------
     def _prompt_embedding(self, prompt: str, size: int = 8) -> np.ndarray:
@@ -317,13 +476,16 @@ class OmniModalMiniturbo:
         length = self._ensure_positive(length, "length")
         sample_rate = self._ensure_positive(sample_rate, "sample_rate", minimum=1000)
         embedding = self._prompt_embedding(prompt, size=6)
-        waveform = self._synth_audio(embedding, length=length, sample_rate=sample_rate)
+        conditioned_embedding, decoder_meta = self._modulate_embedding(prompt, "audio", embedding)
+        waveform = self._synth_audio(conditioned_embedding, length=length, sample_rate=sample_rate)
         metadata = {
             "shape": waveform.shape,
             "sample_rate": sample_rate,
+            "length": length,
             "prompt": prompt,
-            "embedding_norm": float(np.linalg.norm(embedding)),
+            "embedding_norm": float(np.linalg.norm(conditioned_embedding)),
         }
+        metadata = self._merge_metadata(metadata, decoder_meta)
         return _pack_array(waveform, self.device_spec, metadata)
 
     # -- Image -------------------------------------------------------------
@@ -341,18 +503,52 @@ class OmniModalMiniturbo:
             result = np.clip(result, -4.0, 4.0)
         return _normalise(result)
 
+    def _decoder_seed(self, prompt: str, modality: str) -> int:
+        digest = hashlib.sha256(f"{prompt}::{modality}".encode("utf-8")).digest()
+        return int.from_bytes(digest[:8], "little") & 0xFFFFFFFF
+
+    def _modulate_embedding(self, prompt: str, modality: str, embedding: np.ndarray) -> Tuple[np.ndarray, Dict[str, Any]]:
+        decoder = self._decoders[modality]
+        projection, decoder_meta = decoder.project(
+            embedding,
+            seed=self._decoder_seed(prompt, modality),
+            features=min(embedding.size, decoder.max_output_dim),
+        )
+        if projection.size < embedding.size and projection.size > 0:
+            repeats = int(math.ceil(embedding.size / projection.size))
+            projection = np.tile(projection, repeats)[: embedding.size]
+        elif projection.size > embedding.size:
+            projection = projection[: embedding.size]
+        conditioned = _normalise(embedding + 0.25 * projection)
+        return conditioned.astype(np.float32), decoder_meta
+
+    @staticmethod
+    def _merge_metadata(base: Dict[str, Any], decoder_meta: Dict[str, Any]) -> Dict[str, Any]:
+        model_info = decoder_meta.get("model", {})
+        resources = decoder_meta.get("resources", {})
+        metrics = decoder_meta.get("metrics", {})
+        if model_info:
+            base["model"] = model_info
+        if resources:
+            base["resources"] = resources
+        if metrics:
+            base.setdefault("metrics", {}).update(metrics)
+        return base
+
     def generate_image(self, prompt: str, resolution: int = 256) -> DeviceAwareResult:
         prompt = self._ensure_prompt(prompt)
         resolution = self._ensure_positive(resolution, "resolution", minimum=16)
         embedding = self._prompt_embedding(prompt, size=12)
+        conditioned_embedding, decoder_meta = self._modulate_embedding(prompt, "image", embedding)
         latent = self._seed_latent(prompt, (resolution, resolution, 3))
-        image = self._diffuse(latent, embedding)
+        image = self._diffuse(latent, conditioned_embedding)
         metadata = {
             "shape": image.shape,
             "resolution": resolution,
             "prompt": prompt,
-            "embedding_norm": float(np.linalg.norm(embedding)),
+            "embedding_norm": float(np.linalg.norm(conditioned_embedding)),
         }
+        metadata = self._merge_metadata(metadata, decoder_meta)
         return _pack_array(image, self.device_spec, metadata)
 
     # -- Volume ------------------------------------------------------------
@@ -370,12 +566,15 @@ class OmniModalMiniturbo:
         prompt = self._ensure_prompt(prompt)
         volume_size = self._ensure_positive(size if size is not None else 32, "size", minimum=8)
         embedding = self._prompt_embedding(prompt, size=10)
-        volume = self._synth_volume(prompt, embedding, volume_size)
+        conditioned_embedding, decoder_meta = self._modulate_embedding(prompt, "volume", embedding)
+        volume = self._synth_volume(prompt, conditioned_embedding, volume_size)
         metadata = {
             "shape": volume.shape,
+            "size": volume_size,
             "prompt": prompt,
-            "embedding_norm": float(np.linalg.norm(embedding)),
+            "embedding_norm": float(np.linalg.norm(conditioned_embedding)),
         }
+        metadata = self._merge_metadata(metadata, decoder_meta)
         return _pack_array(volume, self.device_spec, metadata)
 
     # -- Video -------------------------------------------------------------
@@ -404,14 +603,65 @@ class OmniModalMiniturbo:
         fps = self._ensure_positive(fps, "fps", minimum=1)
         resolution = self._ensure_positive(resolution, "resolution", minimum=16)
         embedding = self._prompt_embedding(prompt, size=max(8, frames))
-        video = self._synth_video(prompt, embedding, frames, resolution)
+        conditioned_embedding, decoder_meta = self._modulate_embedding(prompt, "video", embedding)
+        video = self._synth_video(prompt, conditioned_embedding, frames, resolution)
         metadata = {
             "shape": video.shape,
             "prompt": prompt,
             "fps": fps,
-            "embedding_norm": float(np.linalg.norm(embedding)),
+            "frames": frames,
+            "embedding_norm": float(np.linalg.norm(conditioned_embedding)),
         }
+        metadata = self._merge_metadata(metadata, decoder_meta)
         return _pack_array(video, self.device_spec, metadata)
+
+    @property
+    def last_benchmark(self) -> Optional[Dict[str, Any]]:
+        """Return benchmarking metadata recorded during the last bundle run."""
+
+        return self._last_benchmark
+
+    # -- Parallel orchestration -------------------------------------------
+    def _modality_cost_hint(self, key: str, kwargs: Dict[str, Any]) -> float:
+        """Return a heuristic cost estimate used for work-stealing scheduling."""
+
+        if key == "audio":
+            length = kwargs.get("length", 2048)
+            return float(max(1, length) / 2048.0)
+        if key == "image":
+            resolution = kwargs.get("resolution", 256)
+            return float(max(16, resolution) ** 2 / 256.0**2)
+        if key == "volume":
+            size = kwargs.get("size", 32)
+            return float(max(8, size) ** 3 / 32.0**3)
+        if key == "video":
+            frames = kwargs.get("frames", 16)
+            resolution = kwargs.get("resolution", 128)
+            return float(max(1, frames) * max(16, resolution) ** 2 / (16.0 * 128.0**2))
+        return 1.0
+
+    def _supports_cuda_ipc(self) -> bool:
+        """Return ``True`` when the active device can leverage CUDA IPC."""
+
+        backend = self.device_spec.backend
+        device = self.device_spec.device
+        if backend == BACKEND_TORCH and device.startswith("cuda") and _TORCH_AVAILABLE:
+            assert torch is not None  # for type-checkers
+            try:
+                if not torch.cuda.is_available():
+                    return False
+                major, _minor = torch.cuda.get_device_capability(0)
+                return major >= 3
+            except Exception:  # pragma: no cover - capability detection best effort
+                return False
+        if backend == BACKEND_TVM and "cuda" in device and _TVM_AVAILABLE:
+            assert tvm is not None  # for type-checkers
+            try:
+                cuda_dev = tvm.cuda()
+                return bool(getattr(cuda_dev, "exist", False))
+            except Exception:  # pragma: no cover - capability detection best effort
+                return False
+        return False
 
     # -- Parallel orchestration -------------------------------------------
     def generate_bundle_iter(
@@ -425,6 +675,8 @@ class OmniModalMiniturbo:
         executor: str | None = None,
         max_workers: Optional[int] = None,
         timeout: Optional[float] = None,
+        budgets: Optional[Mapping[str, ResourceBudget]] = None,
+        cancellation: Optional[CancellationToken] = None,
     ) -> Iterator[BundleEvent]:
         """Yield :class:`BundleEvent` instances as modalities finish.
 
@@ -455,6 +707,7 @@ class OmniModalMiniturbo:
         }
 
         worker_count = max_workers or len(tasks)
+        worker_count = max(1, worker_count)
         deadline = time.perf_counter() + timeout if timeout is not None else None
 
         def remaining_timeout() -> Optional[float]:
@@ -465,12 +718,24 @@ class OmniModalMiniturbo:
                 raise TimeoutError("bundle generation timed out before completion")
             return remaining
 
-        should_use_process = (
-            exec_mode == "process"
-            or (exec_mode == "auto" and self.device_spec.backend == BACKEND_NUMPY)
-        ) and self.device_spec.backend == BACKEND_NUMPY
+        supports_ipc = self._supports_cuda_ipc()
+        fallback_to_threads = False
+        use_process = False
+        if exec_mode == "process":
+            if supports_ipc or self.device_spec.backend == BACKEND_NUMPY:
+                use_process = True
+            else:
+                fallback_to_threads = True
+                logger.warning(
+                    "Process executor requested but backend %s/%s does not support CUDA IPC; "
+                    "falling back to threads",
+                    self.device_spec.backend,
+                    self.device_spec.device,
+                )
+        elif exec_mode == "auto":
+            use_process = supports_ipc or self.device_spec.backend == BACKEND_NUMPY
 
-        if should_use_process:
+        if use_process:
             ctx = multiprocessing.get_context("spawn")
             executor_cls = concurrent.futures.ProcessPoolExecutor
             executor_kwargs: Dict[str, Any] = {"max_workers": worker_count, "mp_context": ctx}
@@ -481,43 +746,210 @@ class OmniModalMiniturbo:
         total = len(tasks)
         completed = 0
 
+        token = cancellation
+
         with executor_cls(**executor_kwargs) as pool:
             future_to_key: Dict[concurrent.futures.Future[DeviceAwareResult], Tuple[str, float]] = {}
             for key, (func, kwargs) in tasks.items():
+                if token:
+                    token.raise_if_cancelled()
                 start = time.perf_counter()
                 if should_use_process:
+        task_heap: List[Tuple[float, int, Dict[str, Any]]] = []
+        for index, (key, (func, kwargs)) in enumerate(tasks.items()):
+            spec = {"key": key, "func": func, "kwargs": kwargs}
+            cost = float(self._modality_cost_hint(key, kwargs))
+            heapq.heappush(task_heap, (cost, index, spec))
+
+        benchmark: Dict[str, Any] = {
+            "executor": "process" if use_process else "thread",
+            "requested_executor": exec_mode,
+            "fallback_to_threads": fallback_to_threads,
+            "max_workers": worker_count,
+            "device": {"backend": self.device_spec.backend, "device": self.device_spec.device},
+            "supports_cuda_ipc": supports_ipc,
+            "queue_policy": "work-stealing",
+            "tasks": {},
+            "transport_breakdown": {"pinned_memory": 0, "host_transfer": 0, "zero_copy": 0},
+            "timed_out": False,
+        }
+        if timeout is not None:
+            benchmark["deadline_s"] = timeout
+        benchmark["executor_state"] = {
+            "queue_depth_initial": len(task_heap),
+            "worker_launches": 0,
+            "policy": "work-stealing",
+        }
+
+        schedule_start = time.perf_counter()
+        durations: List[float] = []
+        active: Dict[concurrent.futures.Future[DeviceAwareResult], Dict[str, Any]] = {}
+        dispatch_counter = itertools.count()
+        peak_in_flight = 0
+
+        def submit_next_available(pool: concurrent.futures.Executor) -> None:
+            nonlocal peak_in_flight
+            while len(active) < worker_count and task_heap:
+                cost, _idx, spec = heapq.heappop(task_heap)
+                spec = dict(spec)
+                spec["cost"] = float(cost)
+                spec["dispatch_seq"] = next(dispatch_counter)
+                spec["start_time"] = time.perf_counter()
+                benchmark["executor_state"]["worker_launches"] += 1
+                if use_process:
                     future = pool.submit(
                         _execute_modality,
-                        key,
-                        kwargs,
+                        spec["key"],
+                        spec["kwargs"],
                         self.diffusion_steps,
                         self.device_spec,
+                        True,
                     )
                 else:
-                    future = pool.submit(func, **kwargs)
-                future_to_key[future] = (key, start)
+                    future = pool.submit(spec["func"], **spec["kwargs"])
+                active[future] = spec
+                peak_in_flight = max(peak_in_flight, len(active))
+                benchmark["tasks"][spec["key"]] = {
+                    "dispatch_seq": spec["dispatch_seq"],
+                    "cost_hint": spec["cost"],
+                    "start_offset_s": spec["start_time"] - schedule_start,
+                }
 
+            pending: Set[concurrent.futures.Future[DeviceAwareResult]] = set(future_to_key)
             try:
-                for future in concurrent.futures.as_completed(
-                    future_to_key, timeout=remaining_timeout()
-                ):
-                    key, start = future_to_key[future]
-                    duration = time.perf_counter() - start
-                    result = future.result()
-                    result.metadata.setdefault("metrics", {})["wall_clock_s"] = duration
-                    completed += 1
-                    logger.debug("Generated modality %s in %.3fs", key, duration)
-                    yield BundleEvent(
-                        key=key,
-                        result=result,
-                        duration_s=duration,
-                        completed=completed,
-                        total=total,
+                while pending:
+                    if token:
+                        token.raise_if_cancelled()
+                    wait_timeout = 0.1
+                    try:
+                        remaining = remaining_timeout()
+                        if remaining is not None:
+                            wait_timeout = min(wait_timeout, remaining)
+                    except TimeoutError as exc:
+                        for future in pending:
+                            future.cancel()
+                        raise TimeoutError("bundle generation timed out before completion") from exc
+
+                    done, _ = concurrent.futures.wait(
+                        pending,
+                        timeout=wait_timeout,
+                        return_when=concurrent.futures.FIRST_COMPLETED,
                     )
-            except FuturesTimeoutError as exc:
-                for future in future_to_key:
+                    if not done:
+                        continue
+
+                    for future in done:
+                        pending.discard(future)
+                        key, start = future_to_key.pop(future)
+                        duration = time.perf_counter() - start
+                        try:
+                            result = future.result()
+                        except Exception:
+                            for remaining_future in pending:
+                                remaining_future.cancel()
+                            raise
+
+                        metrics = result.metadata.setdefault("metrics", {})
+                        metrics["wall_clock_s"] = duration
+                        memory_bytes = _estimate_payload_size(result)
+                        resource_info = result.metadata.setdefault("resource", {})
+                        resource_info["memory_bytes"] = memory_bytes
+                        resource_info["cpu_seconds"] = duration
+                        budget = self._resolve_budget(key, budgets)
+                        if budget:
+                            budget.check(key, memory=memory_bytes, cpu=duration)
+                        completed += 1
+                        logger.debug("Generated modality %s in %.3fs", key, duration)
+                        yield BundleEvent(
+                            key=key,
+        with executor_cls(**executor_kwargs) as pool:
+            submit_next_available(pool)
+            try:
+                while active:
+                    timeout_value = remaining_timeout()
+                    done, _ = concurrent.futures.wait(
+                        list(active.keys()),
+                        timeout=timeout_value,
+                        return_when=concurrent.futures.FIRST_COMPLETED,
+                    )
+                    if not done:
+                        raise FuturesTimeoutError()
+                    for future in done:
+                        spec = active.pop(future)
+                        end_time = time.perf_counter()
+                        duration = end_time - spec["start_time"]
+                        result = future.result()
+                        if use_process:
+                            result = _restore_device_result(result, self.device_spec)
+                        transport = result.metadata.setdefault("transport", {})
+                        if use_process and not transport.get("pinned_memory"):
+                            transport.setdefault("host_transfer", True)
+                        if transport.get("pinned_memory"):
+                            benchmark["transport_breakdown"]["pinned_memory"] += 1
+                        elif transport.get("host_transfer"):
+                            benchmark["transport_breakdown"]["host_transfer"] += 1
+                        else:
+                            benchmark["transport_breakdown"]["zero_copy"] += 1
+                        metrics = result.metadata.setdefault("metrics", {})
+                        metrics["wall_clock_s"] = duration
+                        metrics["start_offset_s"] = benchmark["tasks"][spec["key"]]["start_offset_s"]
+                        metrics["end_offset_s"] = end_time - schedule_start
+                        completed += 1
+                        durations.append(duration)
+                        task_entry = benchmark["tasks"][spec["key"]]
+                        task_entry.update(
+                            {
+                                "duration_s": duration,
+                                "end_offset_s": end_time - schedule_start,
+                                "transport": transport,
+                            }
+                        )
+                        logger.debug(
+                            "Generated modality %s in %.3fs (dispatch #%d)",
+                            spec["key"],
+                            duration,
+                            spec["dispatch_seq"],
+                        )
+                        yield BundleEvent(
+                            key=spec["key"],
+                            result=result,
+                            duration_s=duration,
+                            completed=completed,
+                            total=total,
+                        )
+            except GenerationCancelled:
+                for future in pending:
                     future.cancel()
+                raise
+                    submit_next_available(pool)
+            except FuturesTimeoutError as exc:
+                for future in active:
+                    future.cancel()
+                benchmark["timed_out"] = True
                 raise TimeoutError("bundle generation timed out before completion") from exc
+            except TimeoutError:
+                for future in active:
+                    future.cancel()
+                benchmark["timed_out"] = True
+                raise
+            finally:
+                elapsed = time.perf_counter() - schedule_start
+                benchmark["completed"] = completed
+                benchmark["total"] = total
+                benchmark["wall_clock_s"] = elapsed
+                durations_sum = float(sum(durations)) if durations else 0.0
+                benchmark["makespan_s"] = elapsed
+                benchmark["modalities_per_s"] = (completed / elapsed) if elapsed > 0 else 0.0
+                benchmark["speedup_vs_serial"] = (durations_sum / elapsed) if elapsed > 0 else 0.0
+                benchmark["worker_utilisation"] = (
+                    durations_sum / (worker_count * elapsed)
+                    if elapsed > 0 and worker_count > 0
+                    else 0.0
+                )
+                benchmark["average_duration_s"] = (durations_sum / completed) if completed else 0.0
+                benchmark["executor_state"]["queue_depth_final"] = len(task_heap)
+                benchmark["executor_state"]["peak_in_flight"] = peak_in_flight
+                self._last_benchmark = benchmark
 
     def generate_bundle(
         self,
@@ -530,6 +962,8 @@ class OmniModalMiniturbo:
         executor: str | None = None,
         max_workers: Optional[int] = None,
         timeout: Optional[float] = None,
+        budgets: Optional[Mapping[str, ResourceBudget]] = None,
+        cancellation: Optional[CancellationToken] = None,
     ) -> Dict[str, DeviceAwareResult]:
         """Generate all modalities in parallel and return a device-aware bundle.
 
@@ -547,9 +981,10 @@ class OmniModalMiniturbo:
             Sample length of the audio waveform.
         executor:
             Force a specific executor implementation: ``"thread"``,
-            ``"process"`` or ``"auto"`` (default).  ``"process"`` is only
-            honoured when the selected device backend is NumPy because other
-            device types cannot be safely serialised across process boundaries.
+            ``"process"`` or ``"auto"`` (default).  ``"process"`` will be
+            honoured when the backend is NumPy or when CUDA IPC-compatible
+            devices are detected.  Incompatible combinations fall back to
+            threads automatically.
         max_workers:
             Optional override for the parallel worker count.
         timeout:
@@ -568,9 +1003,88 @@ class OmniModalMiniturbo:
             executor=executor,
             max_workers=max_workers,
             timeout=timeout,
+            budgets=budgets,
+            cancellation=cancellation,
         ):
             results[event.key] = event.result
         return results
+
+
+def _serialise_device_result(result: DeviceAwareResult) -> DeviceAwareResult:
+    """Prepare a :class:`DeviceAwareResult` for cross-process transport."""
+
+    metadata = dict(result.metadata)
+    transport = dict(metadata.get("transport", {}))
+    metadata["transport"] = transport
+    backend = result.backend
+    device = result.device
+    data = result.data
+
+    if backend == BACKEND_TORCH and device.startswith("cuda") and _TORCH_AVAILABLE:
+        assert torch is not None  # for type-checkers
+        tensor = data
+        if hasattr(tensor, "detach"):
+            tensor = tensor.detach()
+        try:
+            tensor = tensor.to("cpu", non_blocking=True)
+        except Exception:
+            tensor = tensor.cpu()
+        try:
+            tensor = tensor.pin_memory()
+            transport["pinned_memory"] = True
+        except Exception:  # pragma: no cover - pinning is best-effort
+            transport["pinned_memory"] = False
+        transport["host_transfer"] = True
+        transport.setdefault("original_device", device)
+        return DeviceAwareResult(backend, device, tensor, metadata)
+
+    if backend == BACKEND_TVM and "cuda" in device and _TVM_AVAILABLE:
+        assert tvm is not None  # for type-checkers
+        if hasattr(data, "numpy"):
+            host_array = np.array(data.numpy())  # type: ignore[attr-defined]
+        else:
+            host_array = np.array(data)
+        transport.setdefault("original_device", device)
+        transport["host_transfer"] = True
+        return DeviceAwareResult(backend, device, host_array, metadata)
+
+    metadata.setdefault("transport", transport)
+    return DeviceAwareResult(backend, device, data, metadata)
+
+
+def _restore_device_result(result: DeviceAwareResult, device_spec: DeviceSpec) -> DeviceAwareResult:
+    """Restore transported results back onto the target device when possible."""
+
+    transport = result.metadata.setdefault("transport", {})
+    original_device = transport.get("original_device", device_spec.device if device_spec else result.device)
+    backend = result.backend
+
+    if backend == BACKEND_TORCH and original_device.startswith("cuda") and _TORCH_AVAILABLE:
+        assert torch is not None  # for type-checkers
+        try:
+            tensor = result.data
+            if not isinstance(tensor, torch.Tensor):
+                tensor = torch.as_tensor(np.array(tensor))
+            tensor = tensor.to(original_device, non_blocking=True)
+            transport["restored"] = True
+            return DeviceAwareResult(backend, original_device, tensor, result.metadata)
+        except Exception:  # pragma: no cover - restoration is best-effort
+            transport.setdefault("restored", False)
+            return result
+
+    if backend == BACKEND_TVM and "cuda" in original_device and _TVM_AVAILABLE:
+        assert tvm is not None  # for type-checkers
+        try:
+            ctx = tvm.device(original_device)
+            host_array = result.to_numpy()
+            tvm_array = tvm.nd.array(host_array, device=ctx)
+            transport["restored"] = True
+            return DeviceAwareResult(backend, original_device, tvm_array, result.metadata)
+        except Exception:  # pragma: no cover - restoration is best-effort
+            transport.setdefault("restored", False)
+            return result
+
+    return result
 
 
 def _execute_modality(
@@ -581,7 +1095,8 @@ def _execute_modality(
 ) -> DeviceAwareResult:
     engine = OmniModalMiniturbo(diffusion_steps=diffusion_steps, device_spec=device_spec)
     generator = getattr(engine, f"generate_{modality}")
-    return generator(**kwargs)
+    result = generator(**kwargs)
+    return _serialise_device_result(result)
 
 
 @dataclass(frozen=True)
@@ -605,10 +1120,14 @@ class BundleEvent:
 
 __all__ = [
     "BundleEvent",
+    "BudgetExceededError",
+    "CancellationToken",
     "Application",
     "Const",
+    "GenerationCancelled",
     "Lambda",
     "MetaLogic",
     "OmniModalMiniturbo",
+    "ResourceBudget",
     "Var",
 ]

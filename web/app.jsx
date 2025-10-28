@@ -145,6 +145,26 @@ const translations = {
     timelineElapsed: (time) => `${time} elapsed`,
     timelineStageLabel: "Stage",
     progressAria: (percent) => `Generation ${Math.round(percent)} percent complete.`,
+    omniTitle: "Omni-modal preview stack",
+    omniSubtitle: "Live previews for image, audio, and video outputs.",
+    imagePanelTitle: "Image preview",
+    audioPanelTitle: "Audio playback",
+    audioPanelEmpty: "Audio previews will appear here when available.",
+    audioSlicesTitle: "Volume slicing",
+    audioSlicesEmpty: "Slice data will appear as audio streams are decoded.",
+    audioSliceLabel: (index, start, end) =>
+      `Slice ${index + 1} (${start.toFixed(2)}s – ${end.toFixed(2)}s)`,
+    audioSliceGain: "Gain",
+    audioItemLabel: (index) => `Audio clip ${index + 1}`,
+    videoPanelTitle: "Video playback",
+    videoPanelEmpty: "Video previews will appear here when available.",
+    videoShortcutHint: "Focus a video tile and use Space to play or pause, ←/→ to seek, and M to mute.",
+    videoItemLabel: (index) => `Video clip ${index + 1}`,
+    toggleLegacyLabel: "Legacy diffusion controls",
+    showLegacy: "Show legacy controls",
+    hideLegacy: "Hide legacy controls",
+    helpShortcutVideo: "Video playback shortcuts",
+    helpVideoShortcuts: "Focus a video preview and press Space to play/pause, ←/→ to seek five seconds, or M to toggle mute.",
   },
   es: {
     title: "Difusión Estable en la Web",
@@ -242,6 +262,28 @@ const translations = {
     timelineElapsed: (time) => `${time} transcurridos`,
     timelineStageLabel: "Etapa",
     progressAria: (percent) => `Generación completada al ${Math.round(percent)} por ciento.`,
+    omniTitle: "Vista previa omni-modal",
+    omniSubtitle: "Previsualizaciones en vivo para imágenes, audio y video.",
+    imagePanelTitle: "Vista previa de imagen",
+    audioPanelTitle: "Reproducción de audio",
+    audioPanelEmpty: "Las previsualizaciones de audio aparecerán aquí cuando estén disponibles.",
+    audioSlicesTitle: "Segmentación de volumen",
+    audioSlicesEmpty: "Los datos de segmentos aparecerán a medida que se decodifique el audio.",
+    audioSliceLabel: (index, start, end) =>
+      `Segmento ${index + 1} (${start.toFixed(2)}s – ${end.toFixed(2)}s)`,
+    audioSliceGain: "Ganancia",
+    audioItemLabel: (index) => `Clip de audio ${index + 1}`,
+    videoPanelTitle: "Reproducción de video",
+    videoPanelEmpty: "Las previsualizaciones de video aparecerán aquí cuando estén disponibles.",
+    videoShortcutHint:
+      "Enfoca una tarjeta de video y usa Espacio para reproducir/pausar, ←/→ para avanzar o retroceder y M para silenciar.",
+    videoItemLabel: (index) => `Clip de video ${index + 1}`,
+    toggleLegacyLabel: "Controles clásicos de difusión",
+    showLegacy: "Mostrar controles clásicos",
+    hideLegacy: "Ocultar controles clásicos",
+    helpShortcutVideo: "Atajos de reproducción de video",
+    helpVideoShortcuts:
+      "Enfoca una previsualización de video y presiona Espacio para reproducir/pausar, ←/→ para mover cinco segundos o M para silenciar.",
   },
 };
 
@@ -257,6 +299,25 @@ const vaeDefinitions = [
 ];
 
 const modelOptions = ["Stable-Diffusion-XL", "Stable-Diffusion-1.5"];
+
+function base64ToUint8Array(input) {
+  if (typeof input !== "string" || typeof window === "undefined" || typeof window.atob !== "function") {
+    return null;
+  }
+  try {
+    const normalized = input.replace(/-/g, "+").replace(/_/g, "/");
+    const binary = window.atob(normalized);
+    const length = binary.length;
+    const bytes = new Uint8Array(length);
+    for (let index = 0; index < length; index += 1) {
+      bytes[index] = binary.charCodeAt(index);
+    }
+    return bytes;
+  } catch (error) {
+    console.warn("Failed to decode base64 payload", error);
+    return null;
+  }
+}
 
 function ContextualHelpButton({ label, onClick }) {
   return (
@@ -419,6 +480,10 @@ function App() {
   const [isLogPaused, setIsLogPaused] = useState(false);
   const [logLevelFilter, setLogLevelFilter] = useState("all");
   const [logQuery, setLogQuery] = useState("");
+  const [showLegacyControls, setShowLegacyControls] = useState(false);
+  const [audioPreviews, setAudioPreviews] = useState([]);
+  const [videoPreviews, setVideoPreviews] = useState([]);
+  const [activeVideoId, setActiveVideoId] = useState(null);
 
   const promptRef = useRef(prompt);
   const negativePromptRef = useRef(negativePrompt);
@@ -533,6 +598,11 @@ function App() {
       return didChange ? updated : previous;
     });
   }, [formatDuration, i18n, timelineStageLabels]);
+  const canvasRef = useRef(null);
+  const audioRefs = useRef(new Map());
+  const videoRefs = useRef(new Map());
+  const audioObjectUrls = useRef(new Map());
+  const videoObjectUrls = useRef(new Map());
 
   useEffect(() => {
     promptRef.current = prompt;
@@ -546,6 +616,114 @@ function App() {
   useEffect(() => {
     vaeRef.current = vaeCycle;
   }, [vaeCycle]);
+
+  const registerAudioRef = useCallback(
+    (id) => (element) => {
+      if (!audioRefs.current) {
+        return;
+      }
+      if (element) {
+        audioRefs.current.set(id, element);
+      } else {
+        audioRefs.current.delete(id);
+      }
+    },
+    []
+  );
+
+  const registerVideoRef = useCallback(
+    (id) => (element) => {
+      if (!videoRefs.current) {
+        return;
+      }
+      if (element) {
+        videoRefs.current.set(id, element);
+      } else {
+        videoRefs.current.delete(id);
+      }
+    },
+    []
+  );
+
+  const drawImageToCanvas = useCallback((source) => {
+    const canvas = canvasRef.current;
+    if (!canvas || !source) {
+      return;
+    }
+    const context = canvas.getContext("2d");
+    if (!context) {
+      return;
+    }
+    const image = new Image();
+    image.onload = () => {
+      context.clearRect(0, 0, canvas.width, canvas.height);
+      const scale = Math.min(canvas.width / image.width, canvas.height / image.height);
+      const width = image.width * scale;
+      const height = image.height * scale;
+      const offsetX = (canvas.width - width) / 2;
+      const offsetY = (canvas.height - height) / 2;
+      context.drawImage(image, offsetX, offsetY, width, height);
+    };
+    image.src = source;
+  }, []);
+
+  const handleSliceVolumeChange = useCallback((audioId, sliceIndex, value) => {
+    const numeric = Number(value);
+    const normalized = Number.isFinite(numeric) ? Math.max(0, Math.min(100, numeric)) / 100 : 1;
+    setAudioPreviews((previous) =>
+      previous.map((preview) => {
+        if (preview.id !== audioId) {
+          return preview;
+        }
+        const nextSlices = (preview.slices || []).map((slice, index) =>
+          index === sliceIndex ? { ...slice, gain: normalized } : slice
+        );
+        return { ...preview, slices: nextSlices };
+      })
+    );
+  }, []);
+
+  useEffect(() => {
+    const cleanups = [];
+    audioRefs.current.forEach((element, id) => {
+      const preview = audioPreviews.find((item) => item.id === id);
+      if (!preview || !element) {
+        return;
+      }
+      const slices = preview.slices || [];
+      const updateVolume = () => {
+        if (!element || typeof element.currentTime !== "number") {
+          return;
+        }
+        const current = element.currentTime;
+        let applied = typeof preview.gain === "number" ? preview.gain : 1;
+        for (const slice of slices) {
+          if (
+            typeof slice.start === "number" &&
+            typeof slice.end === "number" &&
+            current >= slice.start &&
+            current <= slice.end
+          ) {
+            if (typeof slice.gain === "number") {
+              applied = slice.gain;
+            } else if (typeof slice.volume === "number") {
+              applied = slice.volume;
+            }
+            break;
+          }
+        }
+        element.volume = Math.max(0, Math.min(1, applied));
+      };
+      element.addEventListener("timeupdate", updateVolume);
+      updateVolume();
+      cleanups.push(() => {
+        element.removeEventListener("timeupdate", updateVolume);
+      });
+    });
+    return () => {
+      cleanups.forEach((dispose) => dispose());
+    };
+  }, [audioPreviews]);
 
   useEffect(() => {
     document.documentElement.lang = language;
@@ -815,6 +993,310 @@ function App() {
     };
   }, [addLogEntry, getSchedulerLabel, i18n, model, recordTimelineEvent]);
 
+  useEffect(() => {
+    return () => {
+      if (typeof URL !== "undefined" && typeof URL.revokeObjectURL === "function") {
+        audioObjectUrls.current.forEach((url) => {
+          URL.revokeObjectURL(url);
+        });
+        videoObjectUrls.current.forEach((url) => {
+          URL.revokeObjectURL(url);
+        });
+      }
+      audioObjectUrls.current.clear();
+      videoObjectUrls.current.clear();
+    };
+  }, []);
+
+  const handleStreamEvent = useCallback(
+    (event) => {
+      if (!event || typeof event !== "object") {
+        return;
+      }
+      if (event.type === "progress") {
+        setProgressState((previous) => ({
+          ...previous,
+          text: event.message || event.text || previous.text,
+          progress:
+            typeof event.progress === "number" ? Math.max(0, Math.min(1, event.progress)) : previous.progress,
+          stage: event.stage || previous.stage,
+        }));
+        if (typeof event.progress === "number") {
+          setIsGenerating(event.progress < 1);
+        }
+        if (event.message || event.text) {
+          setStatusMessage(event.message || event.text);
+        }
+        return;
+      }
+      if (event.type === "status") {
+        if (event.message) {
+          setStatusMessage(event.message);
+          addLogEntry(event.message, event.level || "info");
+        }
+        if (typeof event.progress === "number") {
+          setProgressState((previous) => ({ ...previous, progress: event.progress }));
+          setIsGenerating(event.progress < 1);
+        }
+        return;
+      }
+      if (event.type === "gpu") {
+        if (event.message) {
+          setGpuStatus(event.message);
+        }
+        return;
+      }
+      if (event.type === "log") {
+        if (event.message) {
+          addLogEntry(event.message, event.level || "info");
+        }
+        return;
+      }
+      if (event.type === "lifecycle") {
+        if (event.stage === "start") {
+          setIsGenerating(true);
+          setStatusMessage(i18n.progressPreparing);
+          setProgressState((previous) => ({ ...previous, text: i18n.progressPreparing, progress: 0 }));
+        } else if (event.stage === "complete") {
+          setStatusMessage(i18n.generatorReady);
+        } else if (event.stage === "error") {
+          setIsGenerating(false);
+        } else if (event.stage === "end") {
+          setIsGenerating(false);
+        }
+        return;
+      }
+      if (event.type === "validation-error" && event.field) {
+        setValidationErrors((previous) => ({ ...previous, [event.field]: event.message }));
+        return;
+      }
+      if (event.type === "validation-clear") {
+        setValidationErrors({});
+        return;
+      }
+      if (event.type === "image") {
+        if (event.url) {
+          drawImageToCanvas(event.url);
+          return;
+        }
+        if (event.data) {
+          if (typeof event.data === "string") {
+            drawImageToCanvas(`data:${event.mimeType || "image/png"};base64,${event.data}`);
+          } else if (event.data instanceof ArrayBuffer) {
+            const blob = new Blob([event.data], { type: event.mimeType || "image/png" });
+            const url = URL.createObjectURL(blob);
+            drawImageToCanvas(url);
+            if (typeof URL.revokeObjectURL === "function") {
+              setTimeout(() => URL.revokeObjectURL(url), 1000);
+            }
+          }
+        }
+        return;
+      }
+      if (event.type === "audio" || event.type === "audio-preview") {
+        const id = event.id || `${Date.now()}-${Math.random()}`;
+        let url = event.url;
+        let shouldRevoke = false;
+        if (!url) {
+          if (event.data instanceof ArrayBuffer) {
+            const blob = new Blob([event.data], { type: event.mimeType || "audio/mpeg" });
+            url = URL.createObjectURL(blob);
+            shouldRevoke = true;
+          } else if (typeof event.data === "string") {
+            const bytes = base64ToUint8Array(event.data);
+            if (bytes) {
+              const blob = new Blob([bytes.buffer], { type: event.mimeType || "audio/mpeg" });
+              url = URL.createObjectURL(blob);
+              shouldRevoke = true;
+            }
+          }
+        }
+        if (url) {
+          if (shouldRevoke) {
+            const previous = audioObjectUrls.current.get(id);
+            if (previous && typeof URL.revokeObjectURL === "function") {
+              URL.revokeObjectURL(previous);
+            }
+            audioObjectUrls.current.set(id, url);
+          }
+          setAudioPreviews((previous) => {
+            const next = previous.filter((item) => item.id !== id);
+            const label = event.label || i18n.audioItemLabel(next.length);
+            return [
+              ...next,
+              {
+                id,
+                url,
+                label,
+                mimeType: event.mimeType || "audio/mpeg",
+                slices: Array.isArray(event.slices) ? event.slices : [],
+              },
+            ];
+          });
+        }
+        return;
+      }
+      if (event.type === "audio-slices" || event.type === "audioSlices") {
+        if (!event.id) {
+          return;
+        }
+        setAudioPreviews((previous) =>
+          previous.map((preview) =>
+            preview.id === event.id
+              ? { ...preview, slices: Array.isArray(event.slices) ? event.slices : preview.slices }
+              : preview
+          )
+        );
+        return;
+      }
+      if (event.type === "video" || event.type === "video-preview") {
+        const id = event.id || `${Date.now()}-${Math.random()}`;
+        let url = event.url;
+        let shouldRevoke = false;
+        if (!url) {
+          if (event.data instanceof ArrayBuffer) {
+            const blob = new Blob([event.data], { type: event.mimeType || "video/mp4" });
+            url = URL.createObjectURL(blob);
+            shouldRevoke = true;
+          } else if (typeof event.data === "string") {
+            const bytes = base64ToUint8Array(event.data);
+            if (bytes) {
+              const blob = new Blob([bytes.buffer], { type: event.mimeType || "video/mp4" });
+              url = URL.createObjectURL(blob);
+              shouldRevoke = true;
+            }
+          }
+        }
+        if (url) {
+          if (shouldRevoke) {
+            const previous = videoObjectUrls.current.get(id);
+            if (previous && typeof URL.revokeObjectURL === "function") {
+              URL.revokeObjectURL(previous);
+            }
+            videoObjectUrls.current.set(id, url);
+          }
+          setVideoPreviews((previous) => {
+            const next = previous.filter((item) => item.id !== id);
+            const label = event.label || i18n.videoItemLabel(next.length);
+            return [
+              ...next,
+              {
+                id,
+                url,
+                label,
+                mimeType: event.mimeType || "video/mp4",
+                poster: event.poster || null,
+              },
+            ];
+          });
+        }
+        return;
+      }
+      if (event.type === "clear") {
+        if (event.scope === "audio" || event.scope === "all") {
+          audioObjectUrls.current.forEach((value) => {
+            if (typeof URL.revokeObjectURL === "function") {
+              URL.revokeObjectURL(value);
+            }
+          });
+          audioObjectUrls.current.clear();
+          setAudioPreviews([]);
+        }
+        if (event.scope === "video" || event.scope === "all") {
+          videoObjectUrls.current.forEach((value) => {
+            if (typeof URL.revokeObjectURL === "function") {
+              URL.revokeObjectURL(value);
+            }
+          });
+          videoObjectUrls.current.clear();
+          setVideoPreviews([]);
+        }
+        return;
+      }
+    },
+    [addLogEntry, drawImageToCanvas, i18n]
+  );
+
+  useEffect(() => {
+    if (typeof window === "undefined" || typeof window.WebSocket === "undefined") {
+      return () => {};
+    }
+    let isActive = true;
+    let socket;
+    let buffer = "";
+
+    const processBuffer = (payload) => {
+      buffer += payload;
+      const lines = buffer.split(/\n+/);
+      buffer = lines.pop() || "";
+      lines.forEach((line) => {
+        const trimmed = line.trim();
+        if (!trimmed) {
+          return;
+        }
+        try {
+          const parsed = JSON.parse(trimmed);
+          handleStreamEvent(parsed);
+        } catch (error) {
+          console.warn("Failed to parse stream payload", error, trimmed);
+        }
+      });
+    };
+
+    const connect = () => {
+      const protocol = window.location.protocol === "https:" ? "wss" : "ws";
+      const url = `${protocol}://${window.location.host}/generate`;
+      socket = new WebSocket(url);
+      socket.binaryType = "arraybuffer";
+      socket.addEventListener("open", () => {
+        addLogEntry("Connected to generation stream.");
+      });
+      socket.addEventListener("message", (event) => {
+        if (!isActive) {
+          return;
+        }
+        const data = event.data;
+        if (typeof data === "string") {
+          processBuffer(data);
+        } else if (data instanceof ArrayBuffer) {
+          const decoder = new TextDecoder();
+          processBuffer(decoder.decode(new Uint8Array(data)));
+        } else if (data instanceof Blob && typeof data.text === "function") {
+          data
+            .text()
+            .then(processBuffer)
+            .catch((error) => {
+              console.warn("Failed to decode blob payload", error);
+            });
+        }
+      });
+      socket.addEventListener("error", (error) => {
+        console.error("WebSocket error", error);
+        addLogEntry("WebSocket error while reading generation stream.", "error");
+      });
+      socket.addEventListener("close", () => {
+        if (!isActive) {
+          return;
+        }
+        addLogEntry("Disconnected from generation stream.", "warn");
+        setTimeout(() => {
+          if (isActive) {
+            connect();
+          }
+        }, 1500);
+      });
+    };
+
+    connect();
+
+    return () => {
+      isActive = false;
+      if (socket && socket.readyState === WebSocket.OPEN) {
+        socket.close();
+      }
+    };
+  }, [addLogEntry, handleStreamEvent]);
+
   const previousModelRef = useRef(model);
   useEffect(() => {
     const env = window.tvmjsGlobalEnv;
@@ -916,6 +1398,53 @@ function App() {
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [handleGenerate, cycleTheme, cycleLayout, toggleLogPause, isHelpOpen, helpContext]);
 
+  useEffect(() => {
+    if (activeVideoId && !videoPreviews.some((preview) => preview.id === activeVideoId)) {
+      setActiveVideoId(null);
+    }
+  }, [activeVideoId, videoPreviews]);
+
+  useEffect(() => {
+    function handleVideoKeys(event) {
+      if (!activeVideoId) {
+        return;
+      }
+      if (!event || !event.target) {
+        return;
+      }
+      const targetTag = event.target.tagName;
+      if (targetTag === "INPUT" || targetTag === "TEXTAREA" || targetTag === "SELECT") {
+        return;
+      }
+      if (event.target.isContentEditable) {
+        return;
+      }
+      const element = videoRefs.current.get(activeVideoId);
+      if (!element) {
+        return;
+      }
+      if (event.code === "Space") {
+        event.preventDefault();
+        if (element.paused) {
+          element.play().catch(() => {});
+        } else {
+          element.pause();
+        }
+      } else if (event.code === "ArrowRight") {
+        event.preventDefault();
+        element.currentTime = Math.min(element.duration || element.currentTime + 5, element.currentTime + 5);
+      } else if (event.code === "ArrowLeft") {
+        event.preventDefault();
+        element.currentTime = Math.max(0, element.currentTime - 5);
+      } else if (event.code === "KeyM") {
+        event.preventDefault();
+        element.muted = !element.muted;
+      }
+    }
+    window.addEventListener("keydown", handleVideoKeys);
+    return () => window.removeEventListener("keydown", handleVideoKeys);
+  }, [activeVideoId]);
+
   const helpContent = useMemo(() => {
     if (!helpContext) {
       return null;
@@ -998,6 +1527,7 @@ function App() {
                   <li>
                     <kbd>Alt</kbd> + <kbd>&#96;</kbd> — {i18n.helpShortcutLogs}
                   </li>
+                  <li>{i18n.helpVideoShortcuts}</li>
                 </ul>
               ),
             },
@@ -1055,106 +1585,19 @@ function App() {
         </div>
       </header>
       <main className="layout" aria-live="polite">
-        <section className="control-panel">
-          <form className="control-form" onSubmit={handleGenerate} aria-busy={isGenerating}>
-            <fieldset className="field-group">
-              <legend>
-                {i18n.promptLabel}
-                <ContextualHelpButton
-                  label={`${i18n.openHelp}: ${i18n.promptLabel}`}
-                  onClick={() => openHelp("prompt")}
-                />
-              </legend>
-              <textarea
-                id="inputPrompt"
-                value={prompt}
-                onChange={(event) => setPrompt(event.target.value)}
-                placeholder={i18n.promptPlaceholder}
-                aria-describedby="prompt-helper"
-                aria-invalid={Boolean(validationErrors.prompt)}
-                maxLength={PROMPT_MAX}
-              />
-              <div className="field-helper" id="prompt-helper">
-                <span>{i18n.promptHelp}</span>
-                <span>{i18n.charCount(prompt.length, PROMPT_MAX)}</span>
-              </div>
-              {validationErrors.prompt && (
-                <p className="field-error" role="alert">{validationErrors.prompt}</p>
-              )}
-            </fieldset>
-            <fieldset className="field-group">
-              <legend>
-                {i18n.negativePromptLabel}
-                <ContextualHelpButton
-                  label={`${i18n.openHelp}: ${i18n.negativePromptLabel}`}
-                  onClick={() => openHelp("negativePrompt")}
-                />
-              </legend>
-              <textarea
-                id="negativePrompt"
-                value={negativePrompt}
-                onChange={(event) => setNegativePrompt(event.target.value)}
-                placeholder={i18n.negativePromptPlaceholder}
-                aria-describedby="negative-helper"
-                aria-invalid={Boolean(validationErrors.negativePrompt)}
-                maxLength={NEGATIVE_MAX}
-              />
-              <div className="field-helper" id="negative-helper">
-                <span>{i18n.negativePromptHelp}</span>
-                <span>{i18n.negativeCharCount(negativePrompt.length, NEGATIVE_MAX)}</span>
-              </div>
-              {validationErrors.negativePrompt && (
-                <p className="field-error" role="alert">{validationErrors.negativePrompt}</p>
-              )}
-            </fieldset>
-            <div className="field-row">
-              <div className="field-group compact">
-                <label htmlFor="modelId">{i18n.modelLabel}</label>
-                <select
-                  id="modelId"
-                  value={model}
-                  onChange={(event) => setModel(event.target.value)}
-                >
-                  {modelOptions.map((option) => (
-                    <option key={option} value={option}>
-                      {i18n.modelNames[option] || option}
-                    </option>
-                  ))}
-                </select>
-              </div>
-              <div className="field-group compact">
-                <label htmlFor="schedulerId">
-                  {i18n.schedulerLabel}
-                  <ContextualHelpButton
-                    label={`${i18n.openHelp}: ${i18n.schedulerLabel}`}
-                    onClick={() => openHelp("scheduler")}
-                  />
-                </label>
-                <select
-                  id="schedulerId"
-                  value={scheduler}
-                  onChange={(event) => setScheduler(event.target.value)}
-                >
-                  {availableSchedulers.map((option) => (
-                    <option key={option.value} value={option.value}>
-                      {i18n[option.labelKey]}
-                    </option>
-                  ))}
-                </select>
-              </div>
+        <section className="visual-panel omni-stack">
+          <div className="visual-panel-header">
+            <div>
+              <h2>{i18n.omniTitle}</h2>
+              <p>{i18n.omniSubtitle}</p>
             </div>
-            <div className="field-group compact">
-              <label htmlFor="vaeCycle">
-                {i18n.vaeLabel}
-                <ContextualHelpButton
-                  label={`${i18n.openHelp}: ${i18n.vaeLabel}`}
-                  onClick={() => openHelp("vae")}
-                />
-              </label>
-              <select
-                id="vaeCycle"
-                value={vaeCycle}
-                onChange={(event) => setVaeCycle(event.target.value)}
+            <div className="omni-actions">
+              <span className="legacy-label">{i18n.toggleLegacyLabel}</span>
+              <button
+                type="button"
+                className="primary ghost"
+                onClick={() => setShowLegacyControls((current) => !current)}
+                aria-pressed={showLegacyControls}
               >
                 {vaeDefinitions.map((option) => (
                   <option key={option.value} value={option.value}>
@@ -1282,22 +1725,118 @@ function App() {
             <div className="form-actions">
               <button type="submit" className="primary" disabled={isGenerating}>
                 {isGenerating ? i18n.generating : i18n.generate}
+                {showLegacyControls ? i18n.hideLegacy : i18n.showLegacy}
               </button>
-              <div className="status-announcer" role="status" aria-live="polite">
-                {statusMessage}
-              </div>
             </div>
-          </form>
-        </section>
-        <section className="visual-panel">
-          <div className="canvas-wrapper" aria-live="polite">
-            <canvas
-              id="canvas"
-              width="512"
-              height="512"
-              aria-label="Stable Diffusion output"
-            ></canvas>
           </div>
+          <section className="image-panel" aria-label={i18n.imagePanelTitle}>
+            <h3>{i18n.imagePanelTitle}</h3>
+            <div className="canvas-wrapper" aria-live="polite">
+              <canvas
+                id="canvas"
+                width="512"
+                height="512"
+                aria-label="Stable Diffusion output"
+                ref={canvasRef}
+              ></canvas>
+            </div>
+          </section>
+          <section className="audio-panel" aria-label={i18n.audioPanelTitle}>
+            <h3>{i18n.audioPanelTitle}</h3>
+            {audioPreviews.length === 0 ? (
+              <p>{i18n.audioPanelEmpty}</p>
+            ) : (
+              audioPreviews.map((preview, index) => (
+                <div key={preview.id} className="audio-preview">
+                  <h4>{preview.label || i18n.audioItemLabel(index)}</h4>
+                  <audio
+                    controls
+                    src={preview.url}
+                    ref={registerAudioRef(preview.id)}
+                    data-preview-id={preview.id}
+                  >
+                    Your browser does not support the audio element.
+                  </audio>
+                </div>
+              ))
+            )}
+          </section>
+          <section className="volume-panel" aria-label={i18n.audioSlicesTitle}>
+            <h3>{i18n.audioSlicesTitle}</h3>
+            {audioPreviews.length === 0 ? (
+              <p>{i18n.audioSlicesEmpty}</p>
+            ) : (
+              audioPreviews.map((preview) => (
+                <div key={`${preview.id}-slices`} className="volume-preview">
+                  <h4>{preview.label}</h4>
+                  {preview.slices && preview.slices.length > 0 ? (
+                    preview.slices.map((slice, index) => {
+                      const start = typeof slice.start === "number" ? slice.start : 0;
+                      const end = typeof slice.end === "number" ? slice.end : start;
+                      const gainValue =
+                        typeof slice.gain === "number"
+                          ? slice.gain
+                          : typeof slice.volume === "number"
+                          ? slice.volume
+                          : 1;
+                      return (
+                        <label key={`${preview.id}-${index}`} className="slice-control">
+                          <span>{i18n.audioSliceLabel(index, start, end)}</span>
+                          <input
+                            type="range"
+                            min="0"
+                            max="100"
+                            step="1"
+                            value={Math.round(gainValue * 100)}
+                            onChange={(event) =>
+                              handleSliceVolumeChange(preview.id, index, event.target.value)
+                            }
+                            aria-label={`${preview.label} ${i18n.audioSliceGain} ${index + 1}`}
+                          />
+                        </label>
+                      );
+                    })
+                  ) : (
+                    <p>{i18n.audioSlicesEmpty}</p>
+                  )}
+                </div>
+              ))
+            )}
+          </section>
+          <section className="video-panel" aria-label={i18n.videoPanelTitle}>
+            <h3>{i18n.videoPanelTitle}</h3>
+            <p className="panel-helper">{i18n.videoShortcutHint}</p>
+            {videoPreviews.length === 0 ? (
+              <p>{i18n.videoPanelEmpty}</p>
+            ) : (
+              videoPreviews.map((preview, index) => (
+                <div
+                  key={preview.id}
+                  className={`video-preview${activeVideoId === preview.id ? " active" : ""}`}
+                  tabIndex={0}
+                  onFocus={() => setActiveVideoId(preview.id)}
+                  onMouseEnter={() => setActiveVideoId(preview.id)}
+                  onBlur={(event) => {
+                    if (!event.currentTarget.contains(event.relatedTarget)) {
+                      setActiveVideoId((current) => (current === preview.id ? null : current));
+                    }
+                  }}
+                >
+                  <h4>{preview.label || i18n.videoItemLabel(index)}</h4>
+                  <video
+                    controls
+                    src={preview.url}
+                    poster={preview.poster || undefined}
+                    ref={registerVideoRef(preview.id)}
+                    onPlay={() => setActiveVideoId(preview.id)}
+                    onClick={() => setActiveVideoId(preview.id)}
+                  >
+                    Your browser does not support the video element.
+                  </video>
+                </div>
+              ))
+            )}
+          </section>
           <div className="progress-panel">
             <div className="progress-header">
               <h2>{i18n.progressStatus}</h2>
@@ -1389,9 +1928,7 @@ function App() {
               ) : (
                 filteredLogs.map((entry) => (
                   <div key={entry.id} className={`log-entry log-${entry.level}`}>
-                    <span className="log-timestamp">
-                      {timeFormatter.format(entry.timestamp)}
-                    </span>
+                    <span className="log-timestamp">{timeFormatter.format(entry.timestamp)}</span>
                     <span className="log-message">{entry.message}</span>
                   </div>
                 ))
@@ -1399,6 +1936,199 @@ function App() {
             </div>
           </section>
         </section>
+        {showLegacyControls && (
+          <section className="control-panel">
+            <form className="control-form" onSubmit={handleGenerate} aria-busy={isGenerating}>
+              <fieldset className="field-group">
+                <legend>
+                  {i18n.promptLabel}
+                  <ContextualHelpButton
+                    label={`${i18n.openHelp}: ${i18n.promptLabel}`}
+                    onClick={() => openHelp("prompt")}
+                  />
+                </legend>
+                <textarea
+                  id="inputPrompt"
+                  value={prompt}
+                  onChange={(event) => setPrompt(event.target.value)}
+                  placeholder={i18n.promptPlaceholder}
+                  aria-describedby="prompt-helper"
+                  aria-invalid={Boolean(validationErrors.prompt)}
+                  maxLength={PROMPT_MAX}
+                />
+                <div className="field-helper" id="prompt-helper">
+                  <span>{i18n.promptHelp}</span>
+                  <span>{i18n.charCount(prompt.length, PROMPT_MAX)}</span>
+                </div>
+                {validationErrors.prompt && (
+                  <p className="field-error" role="alert">{validationErrors.prompt}</p>
+                )}
+              </fieldset>
+              <fieldset className="field-group">
+                <legend>
+                  {i18n.negativePromptLabel}
+                  <ContextualHelpButton
+                    label={`${i18n.openHelp}: ${i18n.negativePromptLabel}`}
+                    onClick={() => openHelp("negativePrompt")}
+                  />
+                </legend>
+                <textarea
+                  id="negativePrompt"
+                  value={negativePrompt}
+                  onChange={(event) => setNegativePrompt(event.target.value)}
+                  placeholder={i18n.negativePromptPlaceholder}
+                  aria-describedby="negative-helper"
+                  aria-invalid={Boolean(validationErrors.negativePrompt)}
+                  maxLength={NEGATIVE_MAX}
+                />
+                <div className="field-helper" id="negative-helper">
+                  <span>{i18n.negativePromptHelp}</span>
+                  <span>{i18n.negativeCharCount(negativePrompt.length, NEGATIVE_MAX)}</span>
+                </div>
+                {validationErrors.negativePrompt && (
+                  <p className="field-error" role="alert">{validationErrors.negativePrompt}</p>
+                )}
+              </fieldset>
+              <div className="field-row">
+                <div className="field-group compact">
+                  <label htmlFor="modelId">{i18n.modelLabel}</label>
+                  <select
+                    id="modelId"
+                    value={model}
+                    onChange={(event) => setModel(event.target.value)}
+                  >
+                    {modelOptions.map((option) => (
+                      <option key={option} value={option}>
+                        {i18n.modelNames[option] || option}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div className="field-group compact">
+                  <label htmlFor="schedulerId">
+                    {i18n.schedulerLabel}
+                    <ContextualHelpButton
+                      label={`${i18n.openHelp}: ${i18n.schedulerLabel}`}
+                      onClick={() => openHelp("scheduler")}
+                    />
+                  </label>
+                  <select
+                    id="schedulerId"
+                    value={scheduler}
+                    onChange={(event) => setScheduler(event.target.value)}
+                  >
+                    {availableSchedulers.map((option) => (
+                      <option key={option.value} value={option.value}>
+                        {i18n[option.labelKey]}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              </div>
+              <div className="field-group compact">
+                <label htmlFor="vaeCycle">
+                  {i18n.vaeLabel}
+                  <ContextualHelpButton
+                    label={`${i18n.openHelp}: ${i18n.vaeLabel}`}
+                    onClick={() => openHelp("vae")}
+                  />
+                </label>
+                <select
+                  id="vaeCycle"
+                  value={vaeCycle}
+                  onChange={(event) => setVaeCycle(event.target.value)}
+                >
+                  {vaeDefinitions.map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {i18n[option.labelKey]}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <fieldset className="field-group">
+                <legend>
+                  {i18n.themeLabel}
+                  <ContextualHelpButton
+                    label={`${i18n.openHelp}: ${i18n.themeLabel}`}
+                    onClick={() => openHelp("theme")}
+                  />
+                </legend>
+                <div className="theme-options" role="radiogroup" aria-label={i18n.themeLabel}>
+                  <label>
+                    <input
+                      type="radio"
+                      name="theme"
+                      value="light"
+                      checked={theme === "light"}
+                      onChange={(event) => setTheme(event.target.value)}
+                    />
+                    {i18n.lightTheme}
+                  </label>
+                  <label>
+                    <input
+                      type="radio"
+                      name="theme"
+                      value="dark"
+                      checked={theme === "dark"}
+                      onChange={(event) => setTheme(event.target.value)}
+                    />
+                    {i18n.darkTheme}
+                  </label>
+                  <label>
+                    <input
+                      type="radio"
+                      name="theme"
+                      value="custom"
+                      checked={theme === "custom"}
+                      onChange={(event) => setTheme(event.target.value)}
+                    />
+                    {i18n.customTheme}
+                  </label>
+                </div>
+                {theme === "custom" && (
+                  <div className="palette-controls">
+                    <div className="color-field">
+                      <label htmlFor="accentColor">{i18n.accentLabel}</label>
+                      <input
+                        type="color"
+                        id="accentColor"
+                        value={accentColor}
+                        onChange={(event) => setAccentColor(event.target.value)}
+                      />
+                    </div>
+                    <div className="color-field">
+                      <label htmlFor="backgroundColor">{i18n.backgroundLabel}</label>
+                      <input
+                        type="color"
+                        id="backgroundColor"
+                        value={customBackground}
+                        onChange={(event) => setCustomBackground(event.target.value)}
+                      />
+                    </div>
+                    <div className="color-field">
+                      <label htmlFor="surfaceColor">{i18n.surfaceLabel}</label>
+                      <input
+                        type="color"
+                        id="surfaceColor"
+                        value={customSurface}
+                        onChange={(event) => setCustomSurface(event.target.value)}
+                      />
+                    </div>
+                    <p className="field-helper">{i18n.paletteInstructions}</p>
+                  </div>
+                )}
+              </fieldset>
+              <div className="form-actions">
+                <button type="submit" className="primary" disabled={isGenerating}>
+                  {isGenerating ? i18n.generating : i18n.generate}
+                </button>
+                <div className="status-announcer" role="status" aria-live="polite">
+                  {statusMessage}
+                </div>
+              </div>
+            </form>
+          </section>
+        )}
       </main>
       <div className="sr-only" id="progress-tracker-label" aria-hidden="true"></div>
       <progress

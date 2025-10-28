@@ -1,0 +1,78 @@
+{
+  "prompt": "celestial gardens",
+  "configuration": {
+    "resolution": 32,
+    "frames": 4,
+    "volume_size": 16,
+    "audio_length": 128,
+    "executor": "thread",
+    "max_workers": 2,
+    "diffusion_steps": 2,
+    "backend": "numpy"
+  },
+  "artifacts": {
+    "audio": {
+      "shape": [
+        128
+      ],
+      "dtype": "float32",
+      "statistics": {
+        "mean": 0.09899760782718658,
+        "std": 0.4381493330001831,
+        "min": -0.5014896392822266,
+        "max": 0.9999986290931702
+      }
+    },
+    "image": {
+      "shape": [
+        32,
+        32,
+        3
+      ],
+      "dtype": "float32",
+      "statistics": {
+        "mean": 0.4803416430950165,
+        "std": 0.14107075333595276,
+        "min": 0.0,
+        "max": 1.0
+      }
+    },
+    "volume": {
+      "shape": [
+        16,
+        16,
+        16
+      ],
+      "dtype": "float32",
+      "statistics": {
+        "mean": 0.4385613799095154,
+        "std": 0.063740573823452,
+        "min": 0.0,
+        "max": 1.0
+      }
+    },
+    "video": {
+      "shape": [
+        4,
+        16,
+        16,
+        3
+      ],
+      "dtype": "float32",
+      "statistics": {
+        "mean": 0.4367450177669525,
+        "std": 0.16027969121932983,
+        "min": 0.0,
+        "max": 1.0
+      }
+    }
+  },
+  "tolerances": {
+    "statistics": {
+      "mean": 1e-06,
+      "std": 1e-06,
+      "min": 1e-06,
+      "max": 1e-06
+    }
+  }
+}
