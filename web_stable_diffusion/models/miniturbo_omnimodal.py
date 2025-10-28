@@ -45,6 +45,7 @@ except Exception:  # pragma: no cover - optional dependency
     _TVM_AVAILABLE = False
 
 
+from .compiled_decoders import CompiledDecoder, load_compiled_decoders
 from .modal_generators import (
     BACKEND_NUMPY,
     BACKEND_TORCH,
@@ -259,6 +260,7 @@ class OmniModalMiniturbo:
         self.meta_logic = MetaLogic()
         self.device_spec = device_spec or select_device()
         self.diffusion_steps = diffusion_steps
+        self._decoders: Dict[str, CompiledDecoder] = load_compiled_decoders(self.device_spec)
 
     # -- Validation helpers -----------------------------------------------
     @staticmethod
@@ -317,13 +319,16 @@ class OmniModalMiniturbo:
         length = self._ensure_positive(length, "length")
         sample_rate = self._ensure_positive(sample_rate, "sample_rate", minimum=1000)
         embedding = self._prompt_embedding(prompt, size=6)
-        waveform = self._synth_audio(embedding, length=length, sample_rate=sample_rate)
+        conditioned_embedding, decoder_meta = self._modulate_embedding(prompt, "audio", embedding)
+        waveform = self._synth_audio(conditioned_embedding, length=length, sample_rate=sample_rate)
         metadata = {
             "shape": waveform.shape,
             "sample_rate": sample_rate,
+            "length": length,
             "prompt": prompt,
-            "embedding_norm": float(np.linalg.norm(embedding)),
+            "embedding_norm": float(np.linalg.norm(conditioned_embedding)),
         }
+        metadata = self._merge_metadata(metadata, decoder_meta)
         return _pack_array(waveform, self.device_spec, metadata)
 
     # -- Image -------------------------------------------------------------
@@ -341,18 +346,52 @@ class OmniModalMiniturbo:
             result = np.clip(result, -4.0, 4.0)
         return _normalise(result)
 
+    def _decoder_seed(self, prompt: str, modality: str) -> int:
+        digest = hashlib.sha256(f"{prompt}::{modality}".encode("utf-8")).digest()
+        return int.from_bytes(digest[:8], "little") & 0xFFFFFFFF
+
+    def _modulate_embedding(self, prompt: str, modality: str, embedding: np.ndarray) -> Tuple[np.ndarray, Dict[str, Any]]:
+        decoder = self._decoders[modality]
+        projection, decoder_meta = decoder.project(
+            embedding,
+            seed=self._decoder_seed(prompt, modality),
+            features=min(embedding.size, decoder.max_output_dim),
+        )
+        if projection.size < embedding.size and projection.size > 0:
+            repeats = int(math.ceil(embedding.size / projection.size))
+            projection = np.tile(projection, repeats)[: embedding.size]
+        elif projection.size > embedding.size:
+            projection = projection[: embedding.size]
+        conditioned = _normalise(embedding + 0.25 * projection)
+        return conditioned.astype(np.float32), decoder_meta
+
+    @staticmethod
+    def _merge_metadata(base: Dict[str, Any], decoder_meta: Dict[str, Any]) -> Dict[str, Any]:
+        model_info = decoder_meta.get("model", {})
+        resources = decoder_meta.get("resources", {})
+        metrics = decoder_meta.get("metrics", {})
+        if model_info:
+            base["model"] = model_info
+        if resources:
+            base["resources"] = resources
+        if metrics:
+            base.setdefault("metrics", {}).update(metrics)
+        return base
+
     def generate_image(self, prompt: str, resolution: int = 256) -> DeviceAwareResult:
         prompt = self._ensure_prompt(prompt)
         resolution = self._ensure_positive(resolution, "resolution", minimum=16)
         embedding = self._prompt_embedding(prompt, size=12)
+        conditioned_embedding, decoder_meta = self._modulate_embedding(prompt, "image", embedding)
         latent = self._seed_latent(prompt, (resolution, resolution, 3))
-        image = self._diffuse(latent, embedding)
+        image = self._diffuse(latent, conditioned_embedding)
         metadata = {
             "shape": image.shape,
             "resolution": resolution,
             "prompt": prompt,
-            "embedding_norm": float(np.linalg.norm(embedding)),
+            "embedding_norm": float(np.linalg.norm(conditioned_embedding)),
         }
+        metadata = self._merge_metadata(metadata, decoder_meta)
         return _pack_array(image, self.device_spec, metadata)
 
     # -- Volume ------------------------------------------------------------
@@ -370,12 +409,15 @@ class OmniModalMiniturbo:
         prompt = self._ensure_prompt(prompt)
         volume_size = self._ensure_positive(size if size is not None else 32, "size", minimum=8)
         embedding = self._prompt_embedding(prompt, size=10)
-        volume = self._synth_volume(prompt, embedding, volume_size)
+        conditioned_embedding, decoder_meta = self._modulate_embedding(prompt, "volume", embedding)
+        volume = self._synth_volume(prompt, conditioned_embedding, volume_size)
         metadata = {
             "shape": volume.shape,
+            "size": volume_size,
             "prompt": prompt,
-            "embedding_norm": float(np.linalg.norm(embedding)),
+            "embedding_norm": float(np.linalg.norm(conditioned_embedding)),
         }
+        metadata = self._merge_metadata(metadata, decoder_meta)
         return _pack_array(volume, self.device_spec, metadata)
 
     # -- Video -------------------------------------------------------------
@@ -404,13 +446,16 @@ class OmniModalMiniturbo:
         fps = self._ensure_positive(fps, "fps", minimum=1)
         resolution = self._ensure_positive(resolution, "resolution", minimum=16)
         embedding = self._prompt_embedding(prompt, size=max(8, frames))
-        video = self._synth_video(prompt, embedding, frames, resolution)
+        conditioned_embedding, decoder_meta = self._modulate_embedding(prompt, "video", embedding)
+        video = self._synth_video(prompt, conditioned_embedding, frames, resolution)
         metadata = {
             "shape": video.shape,
             "prompt": prompt,
             "fps": fps,
-            "embedding_norm": float(np.linalg.norm(embedding)),
+            "frames": frames,
+            "embedding_norm": float(np.linalg.norm(conditioned_embedding)),
         }
+        metadata = self._merge_metadata(metadata, decoder_meta)
         return _pack_array(video, self.device_spec, metadata)
 
     # -- Parallel orchestration -------------------------------------------
