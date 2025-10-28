@@ -51,5 +51,21 @@ The app exposes a handful of automation-friendly APIs via `window.tvmjsGlobalEnv
 * `onSchedulerFallback(payload)` — Notify the UI when a scheduler fallback occurs.
 * `reportValidationError({ field, message })` / `clearValidationErrors()` — Surface validation feedback inline.
 * `onGenerationLifecycle(stage)` — Valid stages include `start`, `validation-error`, `error`, `complete`, and `end`. Lifecycle updates reset the timeline, drive announcements, and control the animated status marker.
+* `isStreamingEnabled` — Boolean flag indicating whether the UI has resolved a streaming API base URL.
 
 Automation clients can combine these APIs with the layout dataset attributes to keep the UI in sync with remote workflows.
+
+## Streaming integration
+
+By default the UI attempts to stream results from the FastAPI service exposed by
+`web_stable_diffusion.runtime.api`. The target URL can be controlled by:
+
+* Setting `window.__omnimodalApiConfig = { baseUrl: "http://host:port" }` before
+  the app mounts.
+* Persisting `omnimodal.apiBaseUrl` in `localStorage` (the value is read on
+  startup).
+
+When the page is served from `localhost` or `127.0.0.1`, the UI falls back to
+`http://127.0.0.1:8000` automatically. If the streaming handshake fails the app
+logs the error, announces a fallback banner, and resumes using the legacy
+`tvmjsGlobalEnv` hooks so that demos continue to work without the API.

@@ -41,9 +41,12 @@ limitations include:
   NumPy backend is active.  GPU-backed tensors continue to use thread pools to
   avoid cross-process serialisation, so GIL contention can still surface in
   those scenarios.
-* **No web integration yet** – The React site still renders results from the
-  legacy Stable Diffusion pipeline.  Hooking the omni-modal outputs into the UI
-  remains future work.
+* **Streaming client depends on API availability** – The React site now binds to
+  the FastAPI JSONL endpoint, defaulting to `http://127.0.0.1:8000` on localhost
+  and gracefully falling back to the legacy in-browser runtime when the stream
+  cannot be established. Production deployments should provide an explicit base
+  URL, authentication, and cancellation policies before exposing the UI to end
+  users.
 * **Guardrails still evolving** – Core generation routines now validate prompt
   and dimension parameters, yet advanced resource controls (memory caps,
   streaming cancellation) remain future work.
@@ -57,8 +60,9 @@ being tracked:
    and expose ONNX/TVM graphs for compilation.
 2. Expand GPU-aware task schedulers to overlap modalities without falling back to
    threads when CUDA/TVM backends are active.
-3. Provide REST and WebSocket APIs plus browser integrations that stream
-   incremental results to the front-end.
+3. Harden the streaming client with authenticated requests, cancellation, and
+   optional WebSocket transports so the browser keeps pace with the CLI in
+   production environments.
 4. Expand automated testing to include golden manifests for regression detection
    and UI automation via Playwright.
 5. Document keyboard shortcuts, theming, and accessibility expectations alongside

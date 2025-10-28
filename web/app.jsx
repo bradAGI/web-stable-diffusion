@@ -169,6 +169,21 @@ const translations = {
     helpVideoShortcuts: "Focus a video preview and press Space to play/pause, ←/→ to seek five seconds, or M to toggle mute.",
     manifestTitle: "Generation manifest",
     manifestTimingLabel: (total, elapsed) => `Wall clock total ${total}s (elapsed ${elapsed}s).`,
+    streamingConnected: (host) => `Connected to streaming API at ${host}.`,
+    streamingComplete: "Streaming session completed.",
+    streamingError: "Streaming request failed.",
+    streamingUnsupported: "Streaming responses are not supported by this browser.",
+    streamingToken: (token) => `Cancellation token ${token} registered.`,
+    streamingFallback: "Streaming unavailable—falling back to the legacy runtime.",
+    streamingCancelled: "Generation cancelled.",
+    modalityLabels: {
+      image: "Image",
+      audio: "Audio",
+      video: "Video",
+      volume: "Volume",
+    },
+    modalityStatusReady: (label) => `${label} preview ready.`,
+    modalityStatusProgress: (label, percent) => `${label} ${percent}% complete.`,
   },
   es: {
     title: "Difusión Estable en la Web",
@@ -292,6 +307,21 @@ const translations = {
       "Enfoca una previsualización de video y presiona Espacio para reproducir/pausar, ←/→ para mover cinco segundos o M para silenciar.",
     manifestTitle: "Manifiesto de generación",
     manifestTimingLabel: (total, elapsed) => `Tiempo total ${total}s (transcurrido ${elapsed}s).`,
+    streamingConnected: (host) => `Conectado a la API de transmisión en ${host}.`,
+    streamingComplete: "Sesión de transmisión completada.",
+    streamingError: "La solicitud de transmisión falló.",
+    streamingUnsupported: "El navegador no admite respuestas en transmisión.",
+    streamingToken: (token) => `Token de cancelación ${token} registrado.`,
+    streamingFallback: "Transmisión no disponible; se requiere volver al runtime clásico.",
+    streamingCancelled: "Generación cancelada.",
+    modalityLabels: {
+      image: "Imagen",
+      audio: "Audio",
+      video: "Video",
+      volume: "Volumen",
+    },
+    modalityStatusReady: (label) => `La vista previa de ${label} está lista.`,
+    modalityStatusProgress: (label, percent) => `${label} ${percent}% completado.`,
   },
 };
 
@@ -325,6 +355,54 @@ function base64ToUint8Array(input) {
     console.warn("Failed to decode base64 payload", error);
     return null;
   }
+}
+
+function resolveOmniModalApiConfig() {
+  if (typeof window === "undefined") {
+    return null;
+  }
+  const globalConfig = window.__omnimodalApiConfig || window.__omnimodalConfig || null;
+  let baseUrl = null;
+  let headers = {};
+  if (typeof globalConfig === "string" && globalConfig.trim()) {
+    baseUrl = globalConfig.trim();
+  } else if (globalConfig && typeof globalConfig === "object") {
+    if (globalConfig.enabled === false) {
+      return null;
+    }
+    const candidate = (globalConfig.baseUrl || globalConfig.url || "").trim();
+    if (candidate) {
+      baseUrl = candidate;
+    }
+    if (globalConfig.headers && typeof globalConfig.headers === "object") {
+      headers = { ...globalConfig.headers };
+    }
+  }
+  if ((!baseUrl || baseUrl.length === 0) && typeof window.localStorage !== "undefined") {
+    try {
+      const stored = window.localStorage.getItem("omnimodal.apiBaseUrl");
+      if (stored) {
+        baseUrl = stored.trim();
+      }
+    } catch (error) {
+      console.warn("Unable to read omnimodal.apiBaseUrl from localStorage", error);
+    }
+  }
+  if (!baseUrl || baseUrl.length === 0) {
+    const location = window.location || {};
+    const hostname = location.hostname || "";
+    const protocol = location.protocol && location.protocol !== "file:" ? location.protocol : "http:";
+    if (hostname === "localhost" || hostname === "127.0.0.1" || hostname === "[::1]") {
+      baseUrl = `${protocol}//${hostname}:8000`;
+    }
+  }
+  if (!baseUrl || baseUrl.length === 0) {
+    return null;
+  }
+  return {
+    baseUrl: baseUrl.replace(/\/+$, ""),
+    headers,
+  };
 }
 
 function ContextualHelpButton({ label, onClick }) {
@@ -494,6 +572,7 @@ function App() {
   const [volumePreviews, setVolumePreviews] = useState([]);
   const [generationManifest, setGenerationManifest] = useState(null);
   const [activeVideoId, setActiveVideoId] = useState(null);
+  const streamingConfig = useMemo(() => resolveOmniModalApiConfig(), []);
 
   const promptRef = useRef(prompt);
   const negativePromptRef = useRef(negativePrompt);
@@ -856,6 +935,7 @@ function App() {
 
   useEffect(() => {
     const env = window.tvmjsGlobalEnv || (window.tvmjsGlobalEnv = {});
+    env.isStreamingEnabled = Boolean(streamingConfig);
     env.getPrompt = () => promptRef.current;
     env.getNegativePrompt = () => negativePromptRef.current;
     env.getSchedulerId = () => schedulerRef.current;
@@ -1005,6 +1085,7 @@ function App() {
       env.clearValidationErrors = undefined;
       env.onGenerationLifecycle = undefined;
       env.handleStreamEvent = undefined;
+      env.isStreamingEnabled = undefined;
     };
   }, [addLogEntry, getSchedulerLabel, handleStreamEvent, i18n, model, recordTimelineEvent]);
 
@@ -1026,6 +1107,99 @@ function App() {
   const handleStreamEvent = useCallback(
     (event) => {
       if (!event || typeof event !== "object") {
+        return;
+      }
+      if (event.type === "info" && event.cancel_token) {
+        const message = i18n.streamingToken(event.cancel_token);
+        setStatusMessage(message);
+        addLogEntry(message, "info");
+        return;
+      }
+      if (event.type === "error") {
+        const message = event.message || i18n.streamingError;
+        setStatusMessage(message);
+        addLogEntry(message, "error");
+        setIsGenerating(false);
+        setProgressState((previous) => ({ ...previous, stage: "error" }));
+        recordTimelineEvent({ stage: "error", text: message });
+        return;
+      }
+      if (event.type === "complete") {
+        if (event.manifest) {
+          setGenerationManifest(event.manifest);
+        }
+        setStatusMessage(i18n.generatorReady);
+        addLogEntry(i18n.generatorReady, "info");
+        setIsGenerating(false);
+        setProgressState((previous) => ({ ...previous, stage: "complete", progress: 1, text: i18n.generatorReady }));
+        recordTimelineEvent({ stage: "complete", text: i18n.timelineCompleted, progress: 1 });
+        return;
+      }
+      if (event.type === "modality") {
+        const labels = i18n.modalityLabels || {};
+        const label = labels[event.modality] || event.modality || "modality";
+        const normalizedProgress =
+          typeof event.progress === "number"
+            ? Math.max(0, Math.min(1, event.progress))
+            : event.total && event.completed
+            ? Math.max(0, Math.min(1, event.completed / event.total))
+            : null;
+        const statusText =
+          normalizedProgress !== null
+            ? i18n.modalityStatusProgress(label, Math.round(normalizedProgress * 100))
+            : i18n.modalityStatusReady(label);
+        setStatusMessage(statusText);
+        addLogEntry(statusText, "info");
+        if (normalizedProgress !== null) {
+          setProgressState((previous) => ({
+            ...previous,
+            text: statusText,
+            progress: normalizedProgress,
+            stage: event.modality || previous.stage,
+          }));
+          recordTimelineEvent({
+            stage: event.modality || "progress",
+            text: statusText,
+            progress: normalizedProgress,
+          });
+        }
+        if (event.modality === "image") {
+          handleStreamEvent({
+            type: "image",
+            data: event.payload,
+            encoding: event.encoding,
+            mimeType: event.mime_type,
+            url: event.url,
+          });
+        } else if (event.modality === "audio") {
+          handleStreamEvent({
+            type: "audio",
+            id: event.id,
+            data: event.payload,
+            encoding: event.encoding,
+            mimeType: event.mime_type,
+            url: event.url,
+            slices: event.slices,
+            label: event.label,
+          });
+        } else if (event.modality === "video") {
+          handleStreamEvent({
+            type: "video",
+            id: event.id,
+            data: event.payload,
+            encoding: event.encoding,
+            mimeType: event.mime_type,
+            url: event.url,
+            poster: event.poster,
+            label: event.label,
+          });
+        } else if (event.modality === "volume") {
+          handleStreamEvent({
+            type: "volume",
+            projections: event.projections,
+            mimeType: event.mime_type,
+          });
+        }
         return;
       }
       if (event.type === "progress") {
@@ -1265,7 +1439,97 @@ function App() {
         return;
       }
     },
-    [addLogEntry, drawImageToCanvas, i18n]
+    [addLogEntry, drawImageToCanvas, i18n, recordTimelineEvent]
+  );
+
+  const runStreamingGeneration = useCallback(
+    async () => {
+      if (!streamingConfig) {
+        throw new Error("Streaming API not configured.");
+      }
+      const { baseUrl, headers = {} } = streamingConfig;
+      const normalizedPrompt = (promptRef.current || prompt || "").trim();
+      const payload = {
+        prompt: normalizedPrompt,
+      };
+      handleStreamEvent({ type: "lifecycle", stage: "start" });
+      let response;
+      try {
+        response = await fetch(`${baseUrl}/generate`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Accept: "application/jsonl",
+            ...headers,
+          },
+          body: JSON.stringify(payload),
+        });
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        throw new Error(`${i18n.streamingError}: ${detail}`);
+      }
+      if (!response.ok) {
+        throw new Error(`${i18n.streamingError}: ${response.status} ${response.statusText}`);
+      }
+      if (!response.body || typeof response.body.getReader !== "function") {
+        throw new Error(i18n.streamingUnsupported);
+      }
+      addLogEntry(i18n.streamingConnected(baseUrl), "info");
+      setStatusMessage(i18n.streamingConnected(baseUrl));
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let sawTerminalEvent = false;
+      const processLine = (line) => {
+        if (!line) {
+          return;
+        }
+        let parsed;
+        try {
+          parsed = JSON.parse(line);
+        } catch (error) {
+          const detail = error instanceof Error ? error.message : String(error);
+          addLogEntry(`Failed to parse streaming payload: ${detail}`, "warn");
+          return;
+        }
+        if (parsed.type === "complete" || parsed.type === "error") {
+          sawTerminalEvent = true;
+        }
+        handleStreamEvent(parsed);
+      };
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) {
+          break;
+        }
+        buffer += decoder.decode(value, { stream: true });
+        let newlineIndex = buffer.indexOf("\n");
+        while (newlineIndex !== -1) {
+          const line = buffer.slice(0, newlineIndex).trim();
+          buffer = buffer.slice(newlineIndex + 1);
+          if (line) {
+            processLine(line);
+          }
+          newlineIndex = buffer.indexOf("\n");
+        }
+      }
+      const remainder = (buffer + decoder.decode()).trim();
+      if (remainder) {
+        remainder.split(/\n+/).forEach((line) => processLine(line.trim()));
+      }
+      if (!sawTerminalEvent) {
+        addLogEntry(i18n.streamingComplete, "info");
+        setStatusMessage(i18n.streamingComplete);
+        recordTimelineEvent({ stage: "complete", text: i18n.streamingComplete, progress: 1 });
+        setProgressState((previous) => ({
+          ...previous,
+          stage: "complete",
+          progress: 1,
+          text: i18n.streamingComplete,
+        }));
+      }
+    },
+    [streamingConfig, addLogEntry, handleStreamEvent, i18n, prompt, recordTimelineEvent]
   );
 
   const previousModelRef = useRef(model);
@@ -1294,6 +1558,9 @@ function App() {
       if (event) {
         event.preventDefault();
       }
+      if (isGenerating) {
+        return;
+      }
       setValidationErrors({});
       setSchedulerFallback(null);
       if (!prompt.trim()) {
@@ -1317,26 +1584,73 @@ function App() {
         setStatusMessage(i18n.validationSummary);
         return;
       }
+      const env = window.tvmjsGlobalEnv;
+      let fallbackUsed = false;
       try {
         setIsGenerating(true);
         setStatusMessage(i18n.progressPreparing);
-        const env = window.tvmjsGlobalEnv;
-        if (env && typeof env.asyncOnGenerate === "function") {
+        setProgressState((previous) => ({
+          ...previous,
+          text: i18n.progressPreparing,
+          progress: 0,
+          stage: "start",
+        }));
+        setGpuStatus("");
+        handleStreamEvent({ type: "clear", scope: "all" });
+        setGenerationManifest(null);
+        if (streamingConfig) {
+          try {
+            await runStreamingGeneration();
+            return;
+          } catch (error) {
+            const message = error && error.message ? error.message : i18n.streamingError;
+            addLogEntry(message, "error");
+            if (env && typeof env.asyncOnGenerate === "function") {
+              if (typeof env.onGenerationLifecycle === "function") {
+                env.onGenerationLifecycle("start");
+              }
+              addLogEntry(i18n.streamingFallback, "warn");
+              setStatusMessage(i18n.streamingFallback);
+              fallbackUsed = true;
+              await env.asyncOnGenerate();
+            } else {
+              setStatusMessage(message);
+              setProgressState((previous) => ({ ...previous, stage: "error" }));
+              recordTimelineEvent({ stage: "error", text: message });
+              throw error;
+            }
+          }
+        } else if (env && typeof env.asyncOnGenerate === "function") {
+          if (typeof env.onGenerationLifecycle === "function") {
+            env.onGenerationLifecycle("start");
+          }
           await env.asyncOnGenerate();
         } else {
-          const message = "Generation API not ready.";
-          addLogEntry(message, "error");
-          setStatusMessage(message);
-          setIsGenerating(false);
+          throw new Error("Generation API not ready.");
         }
       } catch (error) {
-        const message = error && error.message ? error.message : "Generation failed.";
-        addLogEntry(message, "error");
-        setStatusMessage(message);
+        if (!fallbackUsed) {
+          const message = error && error.message ? error.message : "Generation failed.";
+          addLogEntry(message, "error");
+          setStatusMessage(message);
+          setProgressState((previous) => ({ ...previous, stage: "error" }));
+          recordTimelineEvent({ stage: "error", text: message });
+        }
+      } finally {
         setIsGenerating(false);
       }
     },
-    [prompt, negativePrompt, i18n, addLogEntry]
+    [
+      isGenerating,
+      prompt,
+      negativePrompt,
+      i18n,
+      addLogEntry,
+      streamingConfig,
+      runStreamingGeneration,
+      handleStreamEvent,
+      recordTimelineEvent,
+    ]
   );
 
   useEffect(() => {
