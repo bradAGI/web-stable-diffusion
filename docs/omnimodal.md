@@ -24,6 +24,11 @@ examples without downloading large diffusion checkpoints.
   argument validation, surfaces structured logging, and writes compressed `.npz`
   files plus a `manifest.json` describing metadata and per-modality timing
   metrics.
+* **Benchmark instrumentation** – Every bundle run records executor choices,
+  work-stealing dispatch order, transfer strategy, and a dispatch/completion
+  timeline.  The CLI serialises this telemetry into the manifest so operators
+  can analyse speed-up, worker utilisation, and resource ceilings without
+  replaying workloads.
 
 ## Limitations
 

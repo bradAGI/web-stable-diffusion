@@ -706,8 +706,7 @@ class OmniModalMiniturbo:
             ),
         }
 
-        worker_count = max_workers or len(tasks)
-        worker_count = max(1, worker_count)
+        worker_count = max(1, max_workers or len(tasks))
         deadline = time.perf_counter() + timeout if timeout is not None else None
 
         def remaining_timeout() -> Optional[float]:
@@ -743,18 +742,6 @@ class OmniModalMiniturbo:
             executor_cls = concurrent.futures.ThreadPoolExecutor
             executor_kwargs = {"max_workers": worker_count}
 
-        total = len(tasks)
-        completed = 0
-
-        token = cancellation
-
-        with executor_cls(**executor_kwargs) as pool:
-            future_to_key: Dict[concurrent.futures.Future[DeviceAwareResult], Tuple[str, float]] = {}
-            for key, (func, kwargs) in tasks.items():
-                if token:
-                    token.raise_if_cancelled()
-                start = time.perf_counter()
-                if should_use_process:
         task_heap: List[Tuple[float, int, Dict[str, Any]]] = []
         for index, (key, (func, kwargs)) in enumerate(tasks.items()):
             spec = {"key": key, "func": func, "kwargs": kwargs}
@@ -772,6 +759,9 @@ class OmniModalMiniturbo:
             "tasks": {},
             "transport_breakdown": {"pinned_memory": 0, "host_transfer": 0, "zero_copy": 0},
             "timed_out": False,
+            "cancelled": False,
+            "timeline": [],
+            "resource_summary": {"memory_bytes_peak": 0, "cpu_seconds_total": 0.0},
         }
         if timeout is not None:
             benchmark["deadline_s"] = timeout
@@ -786,6 +776,8 @@ class OmniModalMiniturbo:
         active: Dict[concurrent.futures.Future[DeviceAwareResult], Dict[str, Any]] = {}
         dispatch_counter = itertools.count()
         peak_in_flight = 0
+        timeline: List[Dict[str, Any]] = benchmark["timeline"]
+        resource_summary = benchmark["resource_summary"]
 
         def submit_next_available(pool: concurrent.futures.Executor) -> None:
             nonlocal peak_in_flight
@@ -803,35 +795,47 @@ class OmniModalMiniturbo:
                         spec["kwargs"],
                         self.diffusion_steps,
                         self.device_spec,
-                        True,
                     )
                 else:
                     future = pool.submit(spec["func"], **spec["kwargs"])
                 active[future] = spec
                 peak_in_flight = max(peak_in_flight, len(active))
+                timeline.append(
+                    {
+                        "type": "dispatch",
+                        "key": spec["key"],
+                        "dispatch_seq": spec["dispatch_seq"],
+                        "timestamp_s": spec["start_time"] - schedule_start,
+                        "active_workers": len(active),
+                    }
+                )
                 benchmark["tasks"][spec["key"]] = {
                     "dispatch_seq": spec["dispatch_seq"],
                     "cost_hint": spec["cost"],
                     "start_offset_s": spec["start_time"] - schedule_start,
                 }
 
-            pending: Set[concurrent.futures.Future[DeviceAwareResult]] = set(future_to_key)
-            try:
-                while pending:
+        total = len(tasks)
+        completed = 0
+        token = cancellation
+
+        try:
+            with executor_cls(**executor_kwargs) as pool:
+                submit_next_available(pool)
+                while active:
                     if token:
                         token.raise_if_cancelled()
-                    wait_timeout = 0.1
+
                     try:
-                        remaining = remaining_timeout()
-                        if remaining is not None:
-                            wait_timeout = min(wait_timeout, remaining)
-                    except TimeoutError as exc:
-                        for future in pending:
+                        wait_timeout = remaining_timeout()
+                    except TimeoutError:
+                        for future in active:
                             future.cancel()
-                        raise TimeoutError("bundle generation timed out before completion") from exc
+                        benchmark["timed_out"] = True
+                        raise
 
                     done, _ = concurrent.futures.wait(
-                        pending,
+                        list(active.keys()),
                         timeout=wait_timeout,
                         return_when=concurrent.futures.FIRST_COMPLETED,
                     )
@@ -839,48 +843,18 @@ class OmniModalMiniturbo:
                         continue
 
                     for future in done:
-                        pending.discard(future)
-                        key, start = future_to_key.pop(future)
-                        duration = time.perf_counter() - start
-                        try:
-                            result = future.result()
-                        except Exception:
-                            for remaining_future in pending:
-                                remaining_future.cancel()
-                            raise
-
-                        metrics = result.metadata.setdefault("metrics", {})
-                        metrics["wall_clock_s"] = duration
-                        memory_bytes = _estimate_payload_size(result)
-                        resource_info = result.metadata.setdefault("resource", {})
-                        resource_info["memory_bytes"] = memory_bytes
-                        resource_info["cpu_seconds"] = duration
-                        budget = self._resolve_budget(key, budgets)
-                        if budget:
-                            budget.check(key, memory=memory_bytes, cpu=duration)
-                        completed += 1
-                        logger.debug("Generated modality %s in %.3fs", key, duration)
-                        yield BundleEvent(
-                            key=key,
-        with executor_cls(**executor_kwargs) as pool:
-            submit_next_available(pool)
-            try:
-                while active:
-                    timeout_value = remaining_timeout()
-                    done, _ = concurrent.futures.wait(
-                        list(active.keys()),
-                        timeout=timeout_value,
-                        return_when=concurrent.futures.FIRST_COMPLETED,
-                    )
-                    if not done:
-                        raise FuturesTimeoutError()
-                    for future in done:
                         spec = active.pop(future)
                         end_time = time.perf_counter()
                         duration = end_time - spec["start_time"]
-                        result = future.result()
+                        try:
+                            result = future.result()
+                        except Exception:
+                            for remaining_future in active:
+                                remaining_future.cancel()
+                            raise
                         if use_process:
                             result = _restore_device_result(result, self.device_spec)
+
                         transport = result.metadata.setdefault("transport", {})
                         if use_process and not transport.get("pinned_memory"):
                             transport.setdefault("host_transfer", True)
@@ -890,10 +864,25 @@ class OmniModalMiniturbo:
                             benchmark["transport_breakdown"]["host_transfer"] += 1
                         else:
                             benchmark["transport_breakdown"]["zero_copy"] += 1
+
                         metrics = result.metadata.setdefault("metrics", {})
                         metrics["wall_clock_s"] = duration
                         metrics["start_offset_s"] = benchmark["tasks"][spec["key"]]["start_offset_s"]
                         metrics["end_offset_s"] = end_time - schedule_start
+
+                        memory_bytes = _estimate_payload_size(result)
+                        resource_info = result.metadata.setdefault("resource", {})
+                        resource_info["memory_bytes"] = memory_bytes
+                        resource_info["cpu_seconds"] = duration
+                        resource_summary["memory_bytes_peak"] = max(
+                            resource_summary["memory_bytes_peak"], memory_bytes
+                        )
+                        resource_summary["cpu_seconds_total"] += duration
+
+                        budget = self._resolve_budget(spec["key"], budgets)
+                        if budget:
+                            budget.check(spec["key"], memory=memory_bytes, cpu=duration)
+
                         completed += 1
                         durations.append(duration)
                         task_entry = benchmark["tasks"][spec["key"]]
@@ -910,6 +899,17 @@ class OmniModalMiniturbo:
                             duration,
                             spec["dispatch_seq"],
                         )
+                        timeline.append(
+                            {
+                                "type": "complete",
+                                "key": spec["key"],
+                                "dispatch_seq": spec["dispatch_seq"],
+                                "timestamp_s": end_time - schedule_start,
+                                "duration_s": duration,
+                                "completed": completed,
+                                "total": total,
+                            }
+                        )
                         yield BundleEvent(
                             key=spec["key"],
                             result=result,
@@ -917,39 +917,36 @@ class OmniModalMiniturbo:
                             completed=completed,
                             total=total,
                         )
-            except GenerationCancelled:
-                for future in pending:
-                    future.cancel()
-                raise
+
                     submit_next_available(pool)
-            except FuturesTimeoutError as exc:
-                for future in active:
-                    future.cancel()
-                benchmark["timed_out"] = True
-                raise TimeoutError("bundle generation timed out before completion") from exc
-            except TimeoutError:
-                for future in active:
-                    future.cancel()
-                benchmark["timed_out"] = True
-                raise
-            finally:
-                elapsed = time.perf_counter() - schedule_start
-                benchmark["completed"] = completed
-                benchmark["total"] = total
-                benchmark["wall_clock_s"] = elapsed
-                durations_sum = float(sum(durations)) if durations else 0.0
-                benchmark["makespan_s"] = elapsed
-                benchmark["modalities_per_s"] = (completed / elapsed) if elapsed > 0 else 0.0
-                benchmark["speedup_vs_serial"] = (durations_sum / elapsed) if elapsed > 0 else 0.0
-                benchmark["worker_utilisation"] = (
-                    durations_sum / (worker_count * elapsed)
-                    if elapsed > 0 and worker_count > 0
-                    else 0.0
-                )
-                benchmark["average_duration_s"] = (durations_sum / completed) if completed else 0.0
-                benchmark["executor_state"]["queue_depth_final"] = len(task_heap)
-                benchmark["executor_state"]["peak_in_flight"] = peak_in_flight
-                self._last_benchmark = benchmark
+        except GenerationCancelled:
+            benchmark["cancelled"] = True
+            if token:
+                benchmark["cancel_reason"] = token.reason
+            raise
+        except TimeoutError:
+            benchmark["timed_out"] = True
+            raise
+        finally:
+            elapsed = time.perf_counter() - schedule_start
+            benchmark["completed"] = completed
+            benchmark["total"] = total
+            benchmark["wall_clock_s"] = elapsed
+            durations_sum = float(sum(durations)) if durations else 0.0
+            benchmark["makespan_s"] = elapsed
+            benchmark["modalities_per_s"] = (completed / elapsed) if elapsed > 0 else 0.0
+            benchmark["speedup_vs_serial"] = (durations_sum / elapsed) if elapsed > 0 else 0.0
+            benchmark["worker_utilisation"] = (
+                durations_sum / (worker_count * elapsed)
+                if elapsed > 0 and worker_count > 0
+                else 0.0
+            )
+            benchmark["average_duration_s"] = (durations_sum / completed) if completed else 0.0
+            benchmark["executor_state"]["queue_depth_final"] = len(task_heap)
+            benchmark["executor_state"]["peak_in_flight"] = peak_in_flight
+            benchmark["resource_summary"]["completed_modalities"] = completed
+            self._last_benchmark = benchmark
+
 
     def generate_bundle(
         self,

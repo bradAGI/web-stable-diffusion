@@ -86,6 +86,7 @@ def _bundle_to_manifest(
     *,
     executor: str,
     device_backend: str,
+    benchmark: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     manifest: Dict[str, Any] = {
         "artifacts": {},
@@ -96,6 +97,8 @@ def _bundle_to_manifest(
             "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         },
     }
+    if benchmark is not None:
+        manifest["metadata"]["benchmark"] = benchmark
     total_duration = 0.0
     for key, result in bundle.items():
         array = result.to_numpy()
@@ -245,6 +248,7 @@ def main(argv: list[str] | None = None) -> int:
         output_dir,
         executor=args.executor,
         device_backend=engine.device_spec.backend,
+        benchmark=engine.last_benchmark,
     )
     manifest_path = output_dir / args.manifest_name
     manifest_path.write_text(json.dumps(manifest, indent=2))

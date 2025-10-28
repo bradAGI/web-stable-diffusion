@@ -40,6 +40,12 @@ installed via `pip`, the same functionality is available through the
 `omnimodal-generate` console script.  Because the payloads remain lightweight,
 they can be versioned, inspected, or piped into downstream evaluation tooling.
 
+Each manifest embeds a detailed `benchmark` section that records the executor
+topology, per-modality scheduling, transport strategy, and a chronological
+timeline of dispatch/completion events.  These traces make it straightforward
+to audit concurrency decisions, calculate achieved speed-up versus serial
+execution, and feed dashboards without bolting on external profilers.
+
 Key flags expose production-ready ergonomics:
 
 * `--executor {auto,thread,process}` controls the parallel backend.  Process
@@ -47,6 +53,8 @@ Key flags expose production-ready ergonomics:
   tasks can scale beyond the Python GIL.
 * `--max-workers` and `--timeout` provide coarse resource budgets for batch
   executions.
+* `--budget-file` enforces per-modality memory/CPU envelopes and has its
+  verdicts surfaced in the manifest benchmark alongside peak resource usage.
 * `--log-level` enables structured logging for integration into observability
   stacks.
 

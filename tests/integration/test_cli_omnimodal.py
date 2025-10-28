@@ -41,6 +41,14 @@ def test_cli_generates_bundle(tmp_path: Path) -> None:
     assert manifest.exists(), result.stdout
     data = json.loads(manifest.read_text())
     assert set(data["artifacts"]) == {"audio", "image", "video", "volume"}
+    benchmark = data["metadata"].get("benchmark")
+    assert benchmark is not None, "benchmark metadata missing"
+    assert benchmark.get("completed") == 4
+    timeline = benchmark.get("timeline", [])
+    assert any(event.get("type") == "dispatch" for event in timeline)
+    assert any(event.get("type") == "complete" for event in timeline)
+    resource_summary = benchmark.get("resource_summary", {})
+    assert resource_summary.get("completed_modalities") == 4
 
     audio_npz = Path(data["artifacts"]["audio"]["file"])
     assert audio_npz.exists()
