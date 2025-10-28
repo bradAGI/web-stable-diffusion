@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import time
 
@@ -8,7 +9,7 @@ import pytest
 
 from web_stable_diffusion.cli import omnimodal as omnimodal_cli
 from web_stable_diffusion.models.miniturbo_omnimodal import OmniModalMiniturbo
-from web_stable_diffusion.models.modal_generators import DeviceSpec, BACKEND_NUMPY
+from web_stable_diffusion.models.modal_generators import BACKEND_NUMPY, DeviceSpec
 
 
 def _numpy_engine() -> OmniModalMiniturbo:
@@ -72,6 +73,48 @@ def test_generate_bundle_honours_timeout(monkeypatch):
             max_workers=1,
             timeout=0.05,
         )
+
+
+def test_generate_bundle_scales_workers_to_cpu(monkeypatch):
+    engine = _numpy_engine()
+
+    monkeypatch.setattr("os.cpu_count", lambda: 2)
+
+    engine.generate_bundle(
+        prompt="quantum dunes",
+        resolution=32,
+        frames=4,
+        volume_size=12,
+        audio_length=64,
+        executor="thread",
+    )
+
+    benchmark = engine.last_benchmark
+    assert benchmark is not None
+    assert benchmark["max_workers"] == 2
+    assert benchmark["requested_max_workers"] is None
+    assert benchmark["cpu_count"] == 2
+
+
+def test_process_executor_reserves_parent_cpu(monkeypatch):
+    engine = _numpy_engine()
+
+    monkeypatch.setattr("os.cpu_count", lambda: 3)
+
+    engine.generate_bundle(
+        prompt="stellar echoes",
+        resolution=32,
+        frames=4,
+        volume_size=12,
+        audio_length=64,
+        executor="process",
+    )
+
+    benchmark = engine.last_benchmark
+    assert benchmark is not None
+    assert benchmark["executor"] == "process"
+    assert benchmark["max_workers"] == 2
+    assert benchmark["cpu_count"] == 3
 
 
 def test_cli_generates_manifest(tmp_path: pathlib.Path):
