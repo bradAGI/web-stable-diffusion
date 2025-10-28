@@ -23,8 +23,8 @@ import itertools
 import logging
 import math
 import multiprocessing
+import threading
 import time
-from concurrent.futures import TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, Iterator, List, Mapping, MutableMapping, Optional, Sequence, Set, Tuple, Union
 
@@ -60,6 +60,124 @@ from .modal_generators import (
 
 
 logger = logging.getLogger(__name__)
+
+
+class GenerationError(RuntimeError):
+    """Base class for structured generation failures."""
+
+    def __init__(self, message: str, *, code: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {"code": self.code, "message": str(self)}
+
+
+class GenerationCancelled(GenerationError):
+    """Raised when a caller-initiated cancellation halts generation."""
+
+    def __init__(self, reason: str | None = None) -> None:
+        super().__init__(reason or "generation cancelled", code="cancelled")
+        self.reason = reason or "cancelled"
+
+    def as_dict(self) -> Dict[str, Any]:
+        payload = super().as_dict()
+        payload["reason"] = self.reason
+        return payload
+
+
+class BudgetExceededError(GenerationError):
+    """Raised when a modality exceeds its configured resource budget."""
+
+    def __init__(
+        self,
+        modality: str,
+        *,
+        metric: str,
+        limit: float,
+        usage: float,
+    ) -> None:
+        message = (
+            f"modality '{modality}' exceeded {metric} budget: "
+            f"{usage:.2f} > {limit:.2f}"
+        )
+        super().__init__(message, code="budget_exceeded")
+        self.modality = modality
+        self.metric = metric
+        self.limit = limit
+        self.usage = usage
+
+    def as_dict(self) -> Dict[str, Any]:
+        payload = super().as_dict()
+        payload.update(
+            {
+                "modality": self.modality,
+                "metric": self.metric,
+                "limit": self.limit,
+                "usage": self.usage,
+            }
+        )
+        return payload
+
+
+@dataclass(frozen=True)
+class ResourceBudget:
+    """Simple resource budget expressed as memory and CPU constraints."""
+
+    max_memory_bytes: Optional[int] = None
+    max_cpu_seconds: Optional[float] = None
+
+    def check(self, modality: str, *, memory: Optional[int], cpu: Optional[float]) -> None:
+        if self.max_memory_bytes is not None and memory is not None:
+            if memory > self.max_memory_bytes:
+                raise BudgetExceededError(
+                    modality,
+                    metric="memory_bytes",
+                    limit=float(self.max_memory_bytes),
+                    usage=float(memory),
+                )
+        if self.max_cpu_seconds is not None and cpu is not None:
+            if cpu > self.max_cpu_seconds:
+                raise BudgetExceededError(
+                    modality,
+                    metric="cpu_seconds",
+                    limit=float(self.max_cpu_seconds),
+                    usage=float(cpu),
+                )
+
+
+class CancellationToken:
+    """Thread-safe cancellation primitive shared across modalities."""
+
+    def __init__(self) -> None:
+        self._event = threading.Event()
+        self._reason: Optional[str] = None
+
+    def cancel(self, reason: Optional[str] = None) -> None:
+        if reason is not None:
+            self._reason = reason
+        self._event.set()
+
+    @property
+    def cancelled(self) -> bool:
+        return self._event.is_set()
+
+    @property
+    def reason(self) -> Optional[str]:
+        return self._reason
+
+    def raise_if_cancelled(self) -> None:
+        if self.cancelled:
+            raise GenerationCancelled(self._reason)
+
+
+DEFAULT_RESOURCE_BUDGETS: Mapping[str, ResourceBudget] = {
+    "audio": ResourceBudget(max_memory_bytes=32 * 1024 * 1024, max_cpu_seconds=15.0),
+    "image": ResourceBudget(max_memory_bytes=48 * 1024 * 1024, max_cpu_seconds=20.0),
+    "volume": ResourceBudget(max_memory_bytes=96 * 1024 * 1024, max_cpu_seconds=25.0),
+    "video": ResourceBudget(max_memory_bytes=256 * 1024 * 1024, max_cpu_seconds=30.0),
+    "default": ResourceBudget(max_memory_bytes=256 * 1024 * 1024, max_cpu_seconds=30.0),
+}
 
 
 # ---------------------------------------------------------------------------
@@ -250,6 +368,24 @@ def _normalise(array: np.ndarray) -> np.ndarray:
     return ((array - min_val) / (max_val - min_val)).astype(np.float32)
 
 
+def _estimate_payload_size(result: DeviceAwareResult) -> int:
+    metadata = result.metadata
+    dtype_name = metadata.get("dtype") if isinstance(metadata, dict) else None
+    shape = metadata.get("shape") if isinstance(metadata, dict) else None
+    if dtype_name is not None and shape is not None:
+        try:
+            dtype = np.dtype(dtype_name)
+            size = int(np.prod(shape))
+            return int(size * dtype.itemsize)
+        except Exception:  # pragma: no cover - defensive
+            pass
+    array = result.to_numpy()
+    if isinstance(metadata, dict):
+        metadata.setdefault("dtype", str(array.dtype))
+        metadata.setdefault("shape", list(array.shape))
+    return int(array.nbytes)
+
+
 class OmniModalMiniturbo:
     """High level omni-modal synthesis engine with neuro-symbolic guidance."""
 
@@ -258,10 +394,15 @@ class OmniModalMiniturbo:
         *,
         diffusion_steps: int = 6,
         device_spec: DeviceSpec | None = None,
+        resource_budgets: Optional[Mapping[str, ResourceBudget]] = None,
     ) -> None:
         self.meta_logic = MetaLogic()
         self.device_spec = device_spec or select_device()
         self.diffusion_steps = diffusion_steps
+        base_budgets = dict(DEFAULT_RESOURCE_BUDGETS)
+        if resource_budgets:
+            base_budgets.update(resource_budgets)
+        self.resource_budgets: Dict[str, ResourceBudget] = base_budgets
         self._last_benchmark: Dict[str, Any] | None = None
         self._decoders: Dict[str, CompiledDecoder] = load_compiled_decoders(self.device_spec)
 
@@ -282,6 +423,19 @@ class OmniModalMiniturbo:
         if not prompt:
             raise ValueError("prompt cannot be empty")
         return prompt
+
+    def _resolve_budget(
+        self,
+        modality: str,
+        overrides: Optional[Mapping[str, ResourceBudget]] = None,
+    ) -> Optional[ResourceBudget]:
+        if overrides and modality in overrides:
+            return overrides[modality]
+        if overrides and "default" in overrides:
+            return overrides["default"]
+        if modality in self.resource_budgets:
+            return self.resource_budgets[modality]
+        return self.resource_budgets.get("default")
 
     # -- Prompt processing -------------------------------------------------
     def _prompt_embedding(self, prompt: str, size: int = 8) -> np.ndarray:
@@ -521,6 +675,8 @@ class OmniModalMiniturbo:
         executor: str | None = None,
         max_workers: Optional[int] = None,
         timeout: Optional[float] = None,
+        budgets: Optional[Mapping[str, ResourceBudget]] = None,
+        cancellation: Optional[CancellationToken] = None,
     ) -> Iterator[BundleEvent]:
         """Yield :class:`BundleEvent` instances as modalities finish.
 
@@ -590,6 +746,15 @@ class OmniModalMiniturbo:
         total = len(tasks)
         completed = 0
 
+        token = cancellation
+
+        with executor_cls(**executor_kwargs) as pool:
+            future_to_key: Dict[concurrent.futures.Future[DeviceAwareResult], Tuple[str, float]] = {}
+            for key, (func, kwargs) in tasks.items():
+                if token:
+                    token.raise_if_cancelled()
+                start = time.perf_counter()
+                if should_use_process:
         task_heap: List[Tuple[float, int, Dict[str, Any]]] = []
         for index, (key, (func, kwargs)) in enumerate(tasks.items()):
             spec = {"key": key, "func": func, "kwargs": kwargs}
@@ -650,6 +815,53 @@ class OmniModalMiniturbo:
                     "start_offset_s": spec["start_time"] - schedule_start,
                 }
 
+            pending: Set[concurrent.futures.Future[DeviceAwareResult]] = set(future_to_key)
+            try:
+                while pending:
+                    if token:
+                        token.raise_if_cancelled()
+                    wait_timeout = 0.1
+                    try:
+                        remaining = remaining_timeout()
+                        if remaining is not None:
+                            wait_timeout = min(wait_timeout, remaining)
+                    except TimeoutError as exc:
+                        for future in pending:
+                            future.cancel()
+                        raise TimeoutError("bundle generation timed out before completion") from exc
+
+                    done, _ = concurrent.futures.wait(
+                        pending,
+                        timeout=wait_timeout,
+                        return_when=concurrent.futures.FIRST_COMPLETED,
+                    )
+                    if not done:
+                        continue
+
+                    for future in done:
+                        pending.discard(future)
+                        key, start = future_to_key.pop(future)
+                        duration = time.perf_counter() - start
+                        try:
+                            result = future.result()
+                        except Exception:
+                            for remaining_future in pending:
+                                remaining_future.cancel()
+                            raise
+
+                        metrics = result.metadata.setdefault("metrics", {})
+                        metrics["wall_clock_s"] = duration
+                        memory_bytes = _estimate_payload_size(result)
+                        resource_info = result.metadata.setdefault("resource", {})
+                        resource_info["memory_bytes"] = memory_bytes
+                        resource_info["cpu_seconds"] = duration
+                        budget = self._resolve_budget(key, budgets)
+                        if budget:
+                            budget.check(key, memory=memory_bytes, cpu=duration)
+                        completed += 1
+                        logger.debug("Generated modality %s in %.3fs", key, duration)
+                        yield BundleEvent(
+                            key=key,
         with executor_cls(**executor_kwargs) as pool:
             submit_next_available(pool)
             try:
@@ -705,6 +917,10 @@ class OmniModalMiniturbo:
                             completed=completed,
                             total=total,
                         )
+            except GenerationCancelled:
+                for future in pending:
+                    future.cancel()
+                raise
                     submit_next_available(pool)
             except FuturesTimeoutError as exc:
                 for future in active:
@@ -746,6 +962,8 @@ class OmniModalMiniturbo:
         executor: str | None = None,
         max_workers: Optional[int] = None,
         timeout: Optional[float] = None,
+        budgets: Optional[Mapping[str, ResourceBudget]] = None,
+        cancellation: Optional[CancellationToken] = None,
     ) -> Dict[str, DeviceAwareResult]:
         """Generate all modalities in parallel and return a device-aware bundle.
 
@@ -785,6 +1003,8 @@ class OmniModalMiniturbo:
             executor=executor,
             max_workers=max_workers,
             timeout=timeout,
+            budgets=budgets,
+            cancellation=cancellation,
         ):
             results[event.key] = event.result
         return results
@@ -900,10 +1120,14 @@ class BundleEvent:
 
 __all__ = [
     "BundleEvent",
+    "BudgetExceededError",
+    "CancellationToken",
     "Application",
     "Const",
+    "GenerationCancelled",
     "Lambda",
     "MetaLogic",
     "OmniModalMiniturbo",
+    "ResourceBudget",
     "Var",
 ]
