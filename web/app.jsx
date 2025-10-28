@@ -1,5 +1,50 @@
 const { useState, useEffect, useMemo, useCallback, useRef } = React;
 
+function hexToHsl(hex) {
+  if (!hex || typeof hex !== "string") {
+    return { h: 240, s: 85, l: 60 };
+  }
+  let normalized = hex.trim().replace(/^#/, "");
+  if (normalized.length === 3) {
+    normalized = normalized
+      .split("")
+      .map((char) => char + char)
+      .join("");
+  }
+  if (normalized.length !== 6) {
+    return { h: 240, s: 85, l: 60 };
+  }
+  const r = parseInt(normalized.slice(0, 2), 16) / 255;
+  const g = parseInt(normalized.slice(2, 4), 16) / 255;
+  const b = parseInt(normalized.slice(4, 6), 16) / 255;
+  const max = Math.max(r, g, b);
+  const min = Math.min(r, g, b);
+  const delta = max - min;
+  let h = 0;
+  if (delta !== 0) {
+    if (max === r) {
+      h = ((g - b) / delta) % 6;
+    } else if (max === g) {
+      h = (b - r) / delta + 2;
+    } else {
+      h = (r - g) / delta + 4;
+    }
+    h *= 60;
+    if (h < 0) {
+      h += 360;
+    }
+  }
+  const l = (max + min) / 2;
+  const s = delta === 0 ? 0 : delta / (1 - Math.abs(2 * l - 1));
+  return {
+    h: Math.round(h),
+    s: Math.round(s * 100),
+    l: Math.round(l * 100),
+  };
+}
+
+const CONTROL_LAYOUT_SEQUENCE = ["classic", "compact", "adaptive"];
+
 const PROMPT_MAX = 1000;
 const NEGATIVE_MAX = 1000;
 
@@ -55,6 +100,8 @@ const translations = {
     helpShortcutGenerate: "Generate image",
     helpShortcutHelp: "Toggle help",
     helpShortcutTheme: "Cycle theme",
+    helpShortcutLayout: "Cycle control layout",
+    helpShortcutLogs: "Pause or resume logs",
     helpAccessibility: "All controls are accessible via keyboard and screen readers.",
     helpPrompt: "Describe what you want to see in the generated image. Be specific for best results.",
     helpNegativePrompt: "List items or qualities you want to avoid in the generated image.",
@@ -71,7 +118,32 @@ const translations = {
     logsTitle: "Activity log",
     logsEmpty: "No log entries yet. Actions and status messages will appear here.",
     clearLogs: "Clear log",
+    logsFilterLabel: "Filter",
+    logsLevelAll: "All",
+    logsLevelInfo: "Info",
+    logsLevelWarn: "Warnings",
+    logsLevelError: "Errors",
+    logsSearchPlaceholder: "Search messages…",
+    logsPause: "Pause",
+    logsResume: "Resume",
+    logsPaused: "Log stream paused.",
+    logsResumed: "Log stream resumed.",
+    logsFilteredEmpty: "No log entries match the current filters.",
     customizingPalette: "Customize palette",
+    layoutLabel: "Control layout",
+    layoutDescription: "Choose how form controls are arranged.",
+    layoutAssistiveHint: "Layouts can also be cycled with Alt + L.",
+    layoutClassic: "Classic",
+    layoutCompact: "Compact",
+    layoutAdaptive: "Adaptive",
+    timelineTitle: "Generation timeline",
+    timelineEmpty: "Timeline updates will appear when a generation starts.",
+    timelineStarted: "Generation started",
+    timelineCompleted: "Generation complete",
+    timelineError: "Generation failed",
+    timelineValidation: "Waiting for corrections",
+    timelineElapsed: (time) => `${time} elapsed`,
+    timelineStageLabel: "Stage",
     progressAria: (percent) => `Generation ${Math.round(percent)} percent complete.`,
     omniTitle: "Omni-modal preview stack",
     omniSubtitle: "Live previews for image, audio, and video outputs.",
@@ -145,6 +217,8 @@ const translations = {
     helpShortcutGenerate: "Generar imagen",
     helpShortcutHelp: "Mostrar/ocultar ayuda",
     helpShortcutTheme: "Cambiar tema",
+    helpShortcutLayout: "Cambiar distribución",
+    helpShortcutLogs: "Pausar o reanudar registro",
     helpAccessibility: "Todos los controles son accesibles mediante teclado y lectores de pantalla.",
     helpPrompt: "Describe lo que quieres ver en la imagen generada. Sé específico para obtener mejores resultados.",
     helpNegativePrompt: "Enumera los elementos o cualidades que deseas evitar en la imagen generada.",
@@ -161,7 +235,32 @@ const translations = {
     logsTitle: "Registro de actividad",
     logsEmpty: "Aún no hay entradas. Aquí aparecerán las acciones y los mensajes de estado.",
     clearLogs: "Borrar registro",
+    logsFilterLabel: "Filtrar",
+    logsLevelAll: "Todo",
+    logsLevelInfo: "Info",
+    logsLevelWarn: "Avisos",
+    logsLevelError: "Errores",
+    logsSearchPlaceholder: "Buscar mensajes…",
+    logsPause: "Pausar",
+    logsResume: "Reanudar",
+    logsPaused: "Transmisión de registro en pausa.",
+    logsResumed: "Transmisión de registro reanudada.",
+    logsFilteredEmpty: "No hay entradas que coincidan con los filtros.",
     customizingPalette: "Personalizar paleta",
+    layoutLabel: "Distribución de controles",
+    layoutDescription: "Elige cómo se organizan los controles.",
+    layoutAssistiveHint: "También puedes alternar con Alt + L.",
+    layoutClassic: "Clásica",
+    layoutCompact: "Compacta",
+    layoutAdaptive: "Adaptable",
+    timelineTitle: "Cronología de generación",
+    timelineEmpty: "Los eventos aparecerán cuando inicie una generación.",
+    timelineStarted: "Generación iniciada",
+    timelineCompleted: "Generación completada",
+    timelineError: "Generación fallida",
+    timelineValidation: "Esperando correcciones",
+    timelineElapsed: (time) => `${time} transcurridos`,
+    timelineStageLabel: "Etapa",
     progressAria: (percent) => `Generación completada al ${Math.round(percent)} por ciento.`,
     omniTitle: "Vista previa omni-modal",
     omniSubtitle: "Previsualizaciones en vivo para imágenes, audio y video.",
@@ -280,6 +379,44 @@ function HelpModal({ isOpen, onClose, content, i18n }) {
   );
 }
 
+function StatusTimeline({ entries, i18n }) {
+  if (!entries || entries.length === 0) {
+    return <p className="timeline-empty">{i18n.timelineEmpty}</p>;
+  }
+
+  return (
+    <ol className="status-timeline" aria-live="polite">
+      {entries.map((entry, index) => {
+        const isLast = index === entries.length - 1;
+        return (
+          <li key={entry.id} className={`status-timeline-item${isLast ? " active" : ""}`}>
+            <div className="status-timeline-marker" aria-hidden="true">
+              <span className="status-timeline-dot"></span>
+            </div>
+            <div className="status-timeline-content">
+              <div className="status-timeline-header">
+                <span className="status-timeline-stage">{entry.label}</span>
+                <time dateTime={new Date(entry.timestamp).toISOString()}>{entry.formattedTime}</time>
+              </div>
+              <div className="status-timeline-body">
+                <p>{entry.message}</p>
+                <div className="status-timeline-meta">
+                  {entry.progress !== null && (
+                    <span className="status-timeline-progress" aria-label={`${i18n.progressStatus}: ${Math.round(entry.progress * 100)}%`}>
+                      {Math.round(entry.progress * 100)}%
+                    </span>
+                  )}
+                  <span className="status-timeline-elapsed">{entry.elapsedLabel}</span>
+                </div>
+              </div>
+            </div>
+          </li>
+        );
+      })}
+    </ol>
+  );
+}
+
 function App() {
   const [language, setLanguage] = useState(() => {
     try {
@@ -332,6 +469,17 @@ function App() {
   const [validationErrors, setValidationErrors] = useState({});
   const [schedulerFallback, setSchedulerFallback] = useState(null);
   const [isGenerating, setIsGenerating] = useState(false);
+  const [controlLayout, setControlLayout] = useState(() => {
+    try {
+      return window.localStorage.getItem("wsd-control-layout") || "classic";
+    } catch (err) {
+      return "classic";
+    }
+  });
+  const [timelineEntries, setTimelineEntries] = useState([]);
+  const [isLogPaused, setIsLogPaused] = useState(false);
+  const [logLevelFilter, setLogLevelFilter] = useState("all");
+  const [logQuery, setLogQuery] = useState("");
   const [showLegacyControls, setShowLegacyControls] = useState(false);
   const [audioPreviews, setAudioPreviews] = useState([]);
   const [videoPreviews, setVideoPreviews] = useState([]);
@@ -341,6 +489,115 @@ function App() {
   const negativePromptRef = useRef(negativePrompt);
   const schedulerRef = useRef(scheduler);
   const vaeRef = useRef(vaeCycle);
+  const logContainerRef = useRef(null);
+  const lastTimelineEventRef = useRef(null);
+  const generationStartRef = useRef(null);
+
+  const timeFormatter = useMemo(() => {
+    try {
+      return new Intl.DateTimeFormat(language === "es" ? "es" : "en", {
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+      });
+    } catch (err) {
+      return {
+        format: (date) => new Date(date).toLocaleTimeString(),
+      };
+    }
+  }, [language]);
+
+  const formatDuration = useCallback((durationMs) => {
+    if (!durationMs || Number.isNaN(durationMs)) {
+      return "0s";
+    }
+    const totalSeconds = Math.max(0, Math.round(durationMs / 1000));
+    const minutes = Math.floor(totalSeconds / 60);
+    const seconds = totalSeconds % 60;
+    if (minutes > 0) {
+      return `${minutes}:${seconds.toString().padStart(2, "0")} min`;
+    }
+    return `${seconds}s`;
+  }, []);
+
+  const cycleLayout = useCallback(() => {
+    setControlLayout((current) => {
+      const index = CONTROL_LAYOUT_SEQUENCE.indexOf(current);
+      const nextIndex = index === -1 ? 0 : (index + 1) % CONTROL_LAYOUT_SEQUENCE.length;
+      return CONTROL_LAYOUT_SEQUENCE[nextIndex];
+    });
+  }, []);
+
+  const timelineStageLabels = useMemo(
+    () => ({
+      start: i18n.timelineStarted,
+      complete: i18n.timelineCompleted,
+      error: i18n.timelineError,
+      "validation-error": i18n.timelineValidation,
+    }),
+    [i18n]
+  );
+
+  const recordTimelineEvent = useCallback(
+    ({ stage, text, progress, timestamp: providedTimestamp }) => {
+      const timestamp = providedTimestamp || Date.now();
+      const normalizedStage = stage || "progress";
+      const defaultLabel = timelineStageLabels[normalizedStage] || text || i18n.timelineStageLabel;
+      const message = text || defaultLabel;
+      const roundedProgress =
+        typeof progress === "number" && !Number.isNaN(progress)
+          ? Math.max(0, Math.min(1, progress))
+          : null;
+      const last = lastTimelineEventRef.current;
+      if (
+        last &&
+        last.stage === normalizedStage &&
+        last.text === message &&
+        (roundedProgress === null || last.progress === roundedProgress)
+      ) {
+        return;
+      }
+      const elapsed = generationStartRef.current ? timestamp - generationStartRef.current : 0;
+      const entry = {
+        id: `${timestamp}-${Math.random()}`,
+        stage: normalizedStage,
+        label: defaultLabel,
+        message,
+        progress: roundedProgress,
+        timestamp,
+        formattedTime: timeFormatter.format(timestamp),
+        elapsedLabel: i18n.timelineElapsed(formatDuration(elapsed)),
+      };
+      setTimelineEntries((previous) => [...previous.slice(-19), entry]);
+      lastTimelineEventRef.current = {
+        stage: normalizedStage,
+        text: message,
+        progress: roundedProgress,
+      };
+    },
+    [formatDuration, i18n, timeFormatter, timelineStageLabels]
+  );
+
+  useEffect(() => {
+    setTimelineEntries((previous) => {
+      let didChange = false;
+      const updated = previous.map((entry) => {
+        const elapsed = generationStartRef.current ? entry.timestamp - generationStartRef.current : 0;
+        const nextLabel = timelineStageLabels[entry.stage] || entry.message;
+        const nextElapsed = i18n.timelineElapsed(formatDuration(elapsed));
+        if (entry.label === nextLabel && entry.elapsedLabel === nextElapsed) {
+          return entry;
+        }
+        didChange = true;
+        return {
+          ...entry,
+          label: nextLabel,
+          elapsedLabel: nextElapsed,
+        };
+      });
+      return didChange ? updated : previous;
+    });
+  }, [formatDuration, i18n, timelineStageLabels]);
   const canvasRef = useRef(null);
   const audioRefs = useRef(new Map());
   const videoRefs = useRef(new Map());
@@ -482,6 +739,10 @@ function App() {
     document.documentElement.style.setProperty("--custom-accent-color", accentColor);
     document.documentElement.style.setProperty("--custom-background-color", customBackground);
     document.documentElement.style.setProperty("--custom-surface-color", customSurface);
+    const { h, s, l } = hexToHsl(accentColor);
+    document.documentElement.style.setProperty("--accent-hue", `${h}deg`);
+    document.documentElement.style.setProperty("--accent-saturation", `${s}%`);
+    document.documentElement.style.setProperty("--accent-lightness", `${l}%`);
     try {
       window.localStorage.setItem("wsd-theme", theme);
       window.localStorage.setItem("wsd-accent", accentColor);
@@ -491,6 +752,15 @@ function App() {
       // ignore storage errors
     }
   }, [theme, accentColor, customBackground, customSurface]);
+
+  useEffect(() => {
+    document.documentElement.dataset.layout = controlLayout;
+    try {
+      window.localStorage.setItem("wsd-control-layout", controlLayout);
+    } catch (err) {
+      // ignore storage errors
+    }
+  }, [controlLayout]);
 
   useEffect(() => {
     setStatusMessage(i18n.generatorReady);
@@ -504,6 +774,39 @@ function App() {
       return next;
     });
   }, []);
+
+  const toggleLogPause = useCallback(() => {
+    setIsLogPaused((previous) => {
+      const next = !previous;
+      addLogEntry(next ? i18n.logsPaused : i18n.logsResumed, "info");
+      return next;
+    });
+  }, [addLogEntry, i18n]);
+
+  const filteredLogs = useMemo(() => {
+    const normalizedQuery = logQuery.trim().toLowerCase();
+    return logs.filter((entry) => {
+      const matchesLevel = logLevelFilter === "all" || entry.level === logLevelFilter;
+      if (!matchesLevel) {
+        return false;
+      }
+      if (!normalizedQuery) {
+        return true;
+      }
+      return entry.message.toLowerCase().includes(normalizedQuery);
+    });
+  }, [logs, logLevelFilter, logQuery]);
+
+  useEffect(() => {
+    if (isLogPaused) {
+      return;
+    }
+    const container = logContainerRef.current;
+    if (!container) {
+      return;
+    }
+    container.scrollTop = container.scrollHeight;
+  }, [filteredLogs, isLogPaused]);
 
   const getSchedulerLabel = useCallback((value) => {
     const def = schedulerDefinitions.find((option) => option.value === value);
@@ -564,13 +867,29 @@ function App() {
       return true;
     };
     env.updateProgress = (report) => {
-      setProgressState(report || { text: "", progress: 0, stage: "" });
-      if (report && typeof report.progress === "number") {
+      if (!report) {
+        setProgressState({ text: "", progress: 0, stage: "" });
+        return true;
+      }
+      setProgressState((previous) => ({
+        text: report.text ?? previous.text,
+        progress:
+          typeof report.progress === "number"
+            ? report.progress
+            : previous.progress,
+        stage: report.stage ?? previous.stage,
+      }));
+      if (typeof report.progress === "number") {
         setIsGenerating(report.progress < 1);
       }
-      if (report && report.text) {
+      if (report.text) {
         setStatusMessage(report.text);
       }
+      recordTimelineEvent({
+        stage: report.stage,
+        text: report.text,
+        progress: report.progress,
+      });
       return true;
     };
     env.updateGpuStatus = (message) => {
@@ -617,16 +936,38 @@ function App() {
     };
     env.onGenerationLifecycle = (stage) => {
       if (stage === "start") {
+        generationStartRef.current = Date.now();
+        lastTimelineEventRef.current = null;
+        setTimelineEntries([]);
+        recordTimelineEvent({
+          stage: "start",
+          text: i18n.timelineStarted,
+          progress: 0,
+          timestamp: generationStartRef.current,
+        });
         setIsGenerating(true);
         setStatusMessage(i18n.progressPreparing);
-        setProgressState((previous) => ({ ...previous, text: i18n.progressPreparing, progress: 0 }));
+        setProgressState((previous) => ({
+          ...previous,
+          text: i18n.progressPreparing,
+          progress: 0,
+          stage: "start",
+        }));
       } else if (stage === "complete") {
+        recordTimelineEvent({ stage: "complete", text: i18n.timelineCompleted, progress: 1 });
         setStatusMessage(i18n.generatorReady);
-      } else if (stage === "error") {
         setIsGenerating(false);
+        setProgressState((previous) => ({ ...previous, stage: "complete", progress: 1 }));
+      } else if (stage === "error") {
+        recordTimelineEvent({ stage: "error", text: i18n.timelineError });
+        setIsGenerating(false);
+        setStatusMessage(i18n.timelineError);
+        setProgressState((previous) => ({ ...previous, stage: "error" }));
       } else if (stage === "validation-error") {
+        recordTimelineEvent({ stage: "validation-error", text: i18n.timelineValidation });
         setIsGenerating(false);
         setStatusMessage(i18n.validationSummary);
+        setProgressState((previous) => ({ ...previous, stage: "validation-error" }));
       } else if (stage === "end") {
         setIsGenerating(false);
       }
@@ -650,7 +991,7 @@ function App() {
       env.clearValidationErrors = undefined;
       env.onGenerationLifecycle = undefined;
     };
-  }, [addLogEntry, getSchedulerLabel, i18n, model]);
+  }, [addLogEntry, getSchedulerLabel, i18n, model, recordTimelineEvent]);
 
   useEffect(() => {
     return () => {
@@ -1043,13 +1384,19 @@ function App() {
       } else if (event.altKey && event.key.toLowerCase() === "t") {
         event.preventDefault();
         cycleTheme();
+      } else if (event.altKey && event.key.toLowerCase() === "l") {
+        event.preventDefault();
+        cycleLayout();
+      } else if (event.altKey && (event.key === "`" || event.code === "Backquote")) {
+        event.preventDefault();
+        toggleLogPause();
       } else if (event.key === "Escape" && isHelpOpen) {
         setIsHelpOpen(false);
       }
     }
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [handleGenerate, cycleTheme, isHelpOpen, helpContext]);
+  }, [handleGenerate, cycleTheme, cycleLayout, toggleLogPause, isHelpOpen, helpContext]);
 
   useEffect(() => {
     if (activeVideoId && !videoPreviews.some((preview) => preview.id === activeVideoId)) {
@@ -1148,6 +1495,14 @@ function App() {
           title: i18n.languageLabel,
           items: [{ title: i18n.languageLabel, content: <p>{i18n.localizationHelp}</p> }],
         };
+      case "layout":
+        return {
+          title: i18n.layoutLabel,
+          items: [
+            { title: i18n.layoutLabel, content: <p>{i18n.layoutDescription}</p> },
+            { title: i18n.help, content: <p>{i18n.layoutAssistiveHint}</p> },
+          ],
+        };
       case "general":
         return {
           title: i18n.helpTitle,
@@ -1166,6 +1521,12 @@ function App() {
                   <li>
                     <kbd>Alt</kbd> + <kbd>T</kbd> — {i18n.helpShortcutTheme}
                   </li>
+                  <li>
+                    <kbd>Alt</kbd> + <kbd>L</kbd> — {i18n.helpShortcutLayout}
+                  </li>
+                  <li>
+                    <kbd>Alt</kbd> + <kbd>&#96;</kbd> — {i18n.helpShortcutLogs}
+                  </li>
                   <li>{i18n.helpVideoShortcuts}</li>
                 </ul>
               ),
@@ -1183,27 +1544,13 @@ function App() {
   const progressText = progressState.text || (isGenerating ? i18n.progressPreparing : i18n.generatorReady);
   const progressAriaLabel = i18n.progressAria(progressPercent);
 
-  const timeFormatter = useMemo(() => {
-    try {
-      return new Intl.DateTimeFormat(language === "es" ? "es" : "en", {
-        hour: "2-digit",
-        minute: "2-digit",
-        second: "2-digit",
-      });
-    } catch (err) {
-      return {
-        format: (date) => new Date(date).toLocaleTimeString(),
-      };
-    }
-  }, [language]);
-
   const openHelp = useCallback((type) => {
     setHelpContext({ type });
     setIsHelpOpen(true);
   }, []);
 
   return (
-    <div className="app" data-generating={isGenerating}>
+    <div className={`app layout-${controlLayout}`} data-generating={isGenerating} data-layout={controlLayout}>
       <header className="toolbar" role="banner">
         <div className="brand">
           <h1>{i18n.title}</h1>
@@ -1252,6 +1599,132 @@ function App() {
                 onClick={() => setShowLegacyControls((current) => !current)}
                 aria-pressed={showLegacyControls}
               >
+                {vaeDefinitions.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {i18n[option.labelKey]}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <fieldset className="field-group">
+              <legend>
+                {i18n.themeLabel}
+                <ContextualHelpButton
+                  label={`${i18n.openHelp}: ${i18n.themeLabel}`}
+                  onClick={() => openHelp("theme")}
+                />
+              </legend>
+              <div className="theme-options" role="radiogroup" aria-label={i18n.themeLabel}>
+                <label>
+                  <input
+                    type="radio"
+                    name="theme"
+                    value="light"
+                    checked={theme === "light"}
+                    onChange={(event) => setTheme(event.target.value)}
+                  />
+                  {i18n.lightTheme}
+                </label>
+                <label>
+                  <input
+                    type="radio"
+                    name="theme"
+                    value="dark"
+                    checked={theme === "dark"}
+                    onChange={(event) => setTheme(event.target.value)}
+                  />
+                  {i18n.darkTheme}
+                </label>
+                <label>
+                  <input
+                    type="radio"
+                    name="theme"
+                    value="custom"
+                    checked={theme === "custom"}
+                    onChange={(event) => setTheme(event.target.value)}
+                  />
+                  {i18n.customTheme}
+                </label>
+              </div>
+              {theme === "custom" && (
+                <div className="palette-controls">
+                  <div className="color-field">
+                    <label htmlFor="accentColor">{i18n.accentLabel}</label>
+                    <input
+                      type="color"
+                      id="accentColor"
+                      value={accentColor}
+                      onChange={(event) => setAccentColor(event.target.value)}
+                    />
+                  </div>
+                  <div className="color-field">
+                    <label htmlFor="backgroundColor">{i18n.backgroundLabel}</label>
+                    <input
+                      type="color"
+                      id="backgroundColor"
+                      value={customBackground}
+                      onChange={(event) => setCustomBackground(event.target.value)}
+                    />
+                  </div>
+                  <div className="color-field">
+                    <label htmlFor="surfaceColor">{i18n.surfaceLabel}</label>
+                    <input
+                      type="color"
+                      id="surfaceColor"
+                      value={customSurface}
+                      onChange={(event) => setCustomSurface(event.target.value)}
+                    />
+                  </div>
+                  <p className="field-helper">{i18n.paletteInstructions}</p>
+                </div>
+              )}
+            </fieldset>
+            <fieldset className="field-group">
+              <legend>
+                {i18n.layoutLabel}
+                <ContextualHelpButton
+                  label={`${i18n.openHelp}: ${i18n.layoutLabel}`}
+                  onClick={() => openHelp("layout")}
+                />
+              </legend>
+              <p className="field-helper">{i18n.layoutDescription}</p>
+              <div className="layout-options" role="radiogroup" aria-label={i18n.layoutLabel}>
+                <label>
+                  <input
+                    type="radio"
+                    name="controlLayout"
+                    value="classic"
+                    checked={controlLayout === "classic"}
+                    onChange={(event) => setControlLayout(event.target.value)}
+                  />
+                  {i18n.layoutClassic}
+                </label>
+                <label>
+                  <input
+                    type="radio"
+                    name="controlLayout"
+                    value="compact"
+                    checked={controlLayout === "compact"}
+                    onChange={(event) => setControlLayout(event.target.value)}
+                  />
+                  {i18n.layoutCompact}
+                </label>
+                <label>
+                  <input
+                    type="radio"
+                    name="controlLayout"
+                    value="adaptive"
+                    checked={controlLayout === "adaptive"}
+                    onChange={(event) => setControlLayout(event.target.value)}
+                  />
+                  {i18n.layoutAdaptive}
+                </label>
+              </div>
+              <p className="field-helper hint">{i18n.layoutAssistiveHint}</p>
+            </fieldset>
+            <div className="form-actions">
+              <button type="submit" className="primary" disabled={isGenerating}>
+                {isGenerating ? i18n.generating : i18n.generate}
                 {showLegacyControls ? i18n.hideLegacy : i18n.showLegacy}
               </button>
             </div>
@@ -1383,6 +1856,12 @@ function App() {
               {isGenerating && <div className="spinner" aria-hidden="true"></div>}
             </div>
           </div>
+          <section className="timeline-panel" aria-label={i18n.timelineTitle}>
+            <div className="timeline-header">
+              <h2>{i18n.timelineTitle}</h2>
+            </div>
+            <StatusTimeline entries={timelineEntries} i18n={i18n} />
+          </section>
           <div className="telemetry-panel">
             <h2>{i18n.gpuStatus}</h2>
             <p aria-live="polite">{gpuStatus || i18n.generatorReady}</p>
@@ -1396,18 +1875,58 @@ function App() {
               </div>
             )}
           </div>
-          <section className="log-panel" aria-label={i18n.logsTitle}>
+          <section className="log-panel" aria-label={i18n.logsTitle} data-paused={isLogPaused}>
             <div className="log-header">
               <h2>{i18n.logsTitle}</h2>
-              <button type="button" className="icon-button" onClick={() => setLogs([])}>
-                {i18n.clearLogs}
-              </button>
+              <div className="log-header-actions">
+                <button type="button" className="icon-button" onClick={() => setLogs([])}>
+                  {i18n.clearLogs}
+                </button>
+                <button
+                  type="button"
+                  className={`icon-button${isLogPaused ? " active" : ""}`}
+                  onClick={toggleLogPause}
+                  aria-pressed={isLogPaused}
+                >
+                  {isLogPaused ? i18n.logsResume : i18n.logsPause}
+                </button>
+              </div>
             </div>
-            <div className="log-entries" role="log" aria-live="polite">
-              {logs.length === 0 ? (
-                <p>{i18n.logsEmpty}</p>
+            <div className="log-controls">
+              <label className="log-filter-label" htmlFor="log-level">
+                {i18n.logsFilterLabel}
+              </label>
+              <select
+                id="log-level"
+                value={logLevelFilter}
+                onChange={(event) => setLogLevelFilter(event.target.value)}
+              >
+                <option value="all">{i18n.logsLevelAll}</option>
+                <option value="info">{i18n.logsLevelInfo}</option>
+                <option value="warn">{i18n.logsLevelWarn}</option>
+                <option value="error">{i18n.logsLevelError}</option>
+              </select>
+              <label className="sr-only" htmlFor="log-search">
+                {i18n.logsSearchPlaceholder}
+              </label>
+              <input
+                id="log-search"
+                type="search"
+                value={logQuery}
+                onChange={(event) => setLogQuery(event.target.value)}
+                placeholder={i18n.logsSearchPlaceholder}
+              />
+            </div>
+            <div
+              className="log-entries"
+              ref={logContainerRef}
+              role="log"
+              aria-live={isLogPaused ? "off" : "polite"}
+            >
+              {filteredLogs.length === 0 ? (
+                <p>{logs.length === 0 ? i18n.logsEmpty : i18n.logsFilteredEmpty}</p>
               ) : (
-                logs.map((entry) => (
+                filteredLogs.map((entry) => (
                   <div key={entry.id} className={`log-entry log-${entry.level}`}>
                     <span className="log-timestamp">{timeFormatter.format(entry.timestamp)}</span>
                     <span className="log-message">{entry.message}</span>
