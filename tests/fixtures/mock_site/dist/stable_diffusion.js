@@ -8,6 +8,8 @@
     if (logElement) {
       logElement.textContent += message + '\n';
     }
+    window.__logEntries = window.__logEntries || [];
+    window.__logEntries.push(message);
   }
 
   window.TokenizerWasmShim =
@@ -15,6 +17,30 @@
     function TokenizerWasmShim(jsonText) {
       this.jsonText = jsonText;
     };
+
+  const STREAM_STAGES = [
+    { stage: 'seed', progress: 0.25 },
+    { stage: 'denoise', progress: 0.6 },
+    { stage: 'final', progress: 1.0 },
+  ];
+
+  function broadcastFrame(canvas, frame) {
+    window.__streamFrames = window.__streamFrames || [];
+    window.__streamFrames.push(frame);
+    canvas.dataset.lastStream = JSON.stringify(frame);
+    canvas.dispatchEvent(new CustomEvent('mock-stream', { detail: frame }));
+  }
+
+  function applyTheme(theme) {
+    document.documentElement.dataset.theme = theme;
+    window.__themeChanges = window.__themeChanges || [];
+    window.__themeChanges.push({ theme, timestamp: Date.now() });
+
+    document.querySelectorAll('[data-theme-button]').forEach((button) => {
+      const isActive = button.dataset.theme === theme;
+      button.setAttribute('aria-pressed', String(isActive));
+    });
+  }
 
   class StableDiffusionInstance {
     constructor() {
@@ -44,9 +70,21 @@
 
       if (progress) {
         progress.value = 100;
+        progress.setAttribute('aria-valuenow', '100');
+        progress.setAttribute('aria-valuetext', 'Generation complete');
       }
       if (canvas) {
         canvas.dataset.lastRender = JSON.stringify({ prompt, negative, scheduler });
+        const theme = document.documentElement.dataset.theme || 'light';
+        STREAM_STAGES.forEach((stage, index) => {
+          setTimeout(() => {
+            broadcastFrame(canvas, {
+              ...stage,
+              theme,
+              timestamp: Date.now(),
+            });
+          }, index * 15);
+        });
       }
       this.logger(`Generated with ${prompt} | scheduler ${scheduler}`);
     }
@@ -84,6 +122,16 @@
       generateButton.addEventListener('click', () => {
         window.tvmjsGlobalEnv.asyncOnGenerate();
       });
+    }
+
+    document
+      .querySelectorAll('[data-theme-button]')
+      .forEach((button) =>
+        button.addEventListener('click', () => applyTheme(button.dataset.theme))
+      );
+
+    if (!document.documentElement.dataset.theme) {
+      applyTheme('light');
     }
   });
 })();

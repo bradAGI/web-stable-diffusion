@@ -66,10 +66,58 @@
     <div id="progress">
       <label id="gpu-tracker-label"></label><br />
       <label id="progress-tracker-label"></label><br />
-      <progress id="progress-tracker-progress" max="100" value="0"></progress>
+      <progress
+        id="progress-tracker-progress"
+        max="100"
+        value="0"
+        role="progressbar"
+        aria-live="polite"
+        aria-valuemin="0"
+        aria-valuemax="100"
+        aria-valuenow="0"
+      ></progress>
+    </div>
+    <div
+      id="theme-controls"
+      role="group"
+      aria-label="Theme selection"
+    >
+      <button
+        id="theme-light"
+        data-theme-button
+        data-theme="light"
+        aria-pressed="true"
+        type="button"
+      >
+        Light theme
+      </button>
+      <button
+        id="theme-dark"
+        data-theme-button
+        data-theme="dark"
+        aria-pressed="false"
+        type="button"
+      >
+        Dark theme
+      </button>
+      <button
+        id="theme-custom"
+        data-theme-button
+        data-theme="custom"
+        aria-pressed="false"
+        type="button"
+      >
+        Custom theme
+      </button>
     </div>
     <button id="generate">Generate</button>
-    <canvas id="canvas" width="512" height="512"></canvas>
-    <div id="log"></div>
+    <canvas
+      id="canvas"
+      width="512"
+      height="512"
+      role="img"
+      aria-label="Generation preview"
+    ></canvas>
+    <div id="log" role="log" aria-live="polite" aria-atomic="false"></div>
   </body>
 </html>
