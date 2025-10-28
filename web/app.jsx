@@ -156,6 +156,8 @@ const translations = {
       `Slice ${index + 1} (${start.toFixed(2)}s – ${end.toFixed(2)}s)`,
     audioSliceGain: "Gain",
     audioItemLabel: (index) => `Audio clip ${index + 1}`,
+    volumePreviewTitle: "Spatial projections",
+    volumePreviewEmpty: "Volume projections will appear once generated.",
     videoPanelTitle: "Video playback",
     videoPanelEmpty: "Video previews will appear here when available.",
     videoShortcutHint: "Focus a video tile and use Space to play or pause, ←/→ to seek, and M to mute.",
@@ -165,6 +167,8 @@ const translations = {
     hideLegacy: "Hide legacy controls",
     helpShortcutVideo: "Video playback shortcuts",
     helpVideoShortcuts: "Focus a video preview and press Space to play/pause, ←/→ to seek five seconds, or M to toggle mute.",
+    manifestTitle: "Generation manifest",
+    manifestTimingLabel: (total, elapsed) => `Wall clock total ${total}s (elapsed ${elapsed}s).`,
   },
   es: {
     title: "Difusión Estable en la Web",
@@ -273,6 +277,8 @@ const translations = {
       `Segmento ${index + 1} (${start.toFixed(2)}s – ${end.toFixed(2)}s)`,
     audioSliceGain: "Ganancia",
     audioItemLabel: (index) => `Clip de audio ${index + 1}`,
+    volumePreviewTitle: "Proyecciones espaciales",
+    volumePreviewEmpty: "Las proyecciones aparecerán cuando estén disponibles.",
     videoPanelTitle: "Reproducción de video",
     videoPanelEmpty: "Las previsualizaciones de video aparecerán aquí cuando estén disponibles.",
     videoShortcutHint:
@@ -284,6 +290,8 @@ const translations = {
     helpShortcutVideo: "Atajos de reproducción de video",
     helpVideoShortcuts:
       "Enfoca una previsualización de video y presiona Espacio para reproducir/pausar, ←/→ para mover cinco segundos o M para silenciar.",
+    manifestTitle: "Manifiesto de generación",
+    manifestTimingLabel: (total, elapsed) => `Tiempo total ${total}s (transcurrido ${elapsed}s).`,
   },
 };
 
@@ -483,6 +491,8 @@ function App() {
   const [showLegacyControls, setShowLegacyControls] = useState(false);
   const [audioPreviews, setAudioPreviews] = useState([]);
   const [videoPreviews, setVideoPreviews] = useState([]);
+  const [volumePreviews, setVolumePreviews] = useState([]);
+  const [generationManifest, setGenerationManifest] = useState(null);
   const [activeVideoId, setActiveVideoId] = useState(null);
 
   const promptRef = useRef(prompt);
@@ -866,6 +876,10 @@ function App() {
       }
       return true;
     };
+    env.handleStreamEvent = (event) => {
+      handleStreamEvent(event);
+      return true;
+    };
     env.updateProgress = (report) => {
       if (!report) {
         setProgressState({ text: "", progress: 0, stage: "" });
@@ -990,8 +1004,9 @@ function App() {
       env.reportValidationError = undefined;
       env.clearValidationErrors = undefined;
       env.onGenerationLifecycle = undefined;
+      env.handleStreamEvent = undefined;
     };
-  }, [addLogEntry, getSchedulerLabel, i18n, model, recordTimelineEvent]);
+  }, [addLogEntry, getSchedulerLabel, handleStreamEvent, i18n, model, recordTimelineEvent]);
 
   useEffect(() => {
     return () => {
@@ -1052,6 +1067,10 @@ function App() {
         }
         return;
       }
+      if (event.type === "manifest") {
+        setGenerationManifest(event.manifest || null);
+        return;
+      }
       if (event.type === "lifecycle") {
         if (event.stage === "start") {
           setIsGenerating(true);
@@ -1081,7 +1100,11 @@ function App() {
         }
         if (event.data) {
           if (typeof event.data === "string") {
-            drawImageToCanvas(`data:${event.mimeType || "image/png"};base64,${event.data}`);
+            if (event.encoding === "base64" || event.data.startsWith("iVBOR")) {
+              drawImageToCanvas(`data:${event.mimeType || "image/png"};base64,${event.data}`);
+            } else {
+              drawImageToCanvas(event.data);
+            }
           } else if (event.data instanceof ArrayBuffer) {
             const blob = new Blob([event.data], { type: event.mimeType || "image/png" });
             const url = URL.createObjectURL(blob);
@@ -1099,13 +1122,13 @@ function App() {
         let shouldRevoke = false;
         if (!url) {
           if (event.data instanceof ArrayBuffer) {
-            const blob = new Blob([event.data], { type: event.mimeType || "audio/mpeg" });
+            const blob = new Blob([event.data], { type: event.mimeType || "audio/wav" });
             url = URL.createObjectURL(blob);
             shouldRevoke = true;
           } else if (typeof event.data === "string") {
             const bytes = base64ToUint8Array(event.data);
             if (bytes) {
-              const blob = new Blob([bytes.buffer], { type: event.mimeType || "audio/mpeg" });
+              const blob = new Blob([bytes.buffer], { type: event.mimeType || "audio/wav" });
               url = URL.createObjectURL(blob);
               shouldRevoke = true;
             }
@@ -1128,7 +1151,7 @@ function App() {
                 id,
                 url,
                 label,
-                mimeType: event.mimeType || "audio/mpeg",
+                mimeType: event.mimeType || "audio/wav",
                 slices: Array.isArray(event.slices) ? event.slices : [],
               },
             ];
@@ -1159,11 +1182,19 @@ function App() {
             url = URL.createObjectURL(blob);
             shouldRevoke = true;
           } else if (typeof event.data === "string") {
-            const bytes = base64ToUint8Array(event.data);
-            if (bytes) {
-              const blob = new Blob([bytes.buffer], { type: event.mimeType || "video/mp4" });
-              url = URL.createObjectURL(blob);
-              shouldRevoke = true;
+            const mime = event.mimeType || "video/mp4";
+            if ((event.encoding === "base64" || true) && typeof window !== "undefined") {
+              const prefix = `data:${mime};base64,${event.data}`;
+              if (mime.startsWith("image/")) {
+                url = prefix;
+              } else {
+                const bytes = base64ToUint8Array(event.data);
+                if (bytes) {
+                  const blob = new Blob([bytes.buffer], { type: mime });
+                  url = URL.createObjectURL(blob);
+                  shouldRevoke = true;
+                }
+              }
             }
           }
         }
@@ -1186,6 +1217,7 @@ function App() {
                 label,
                 mimeType: event.mimeType || "video/mp4",
                 poster: event.poster || null,
+                kind: event.mimeType && event.mimeType.startsWith("image/") ? "image" : "video",
               },
             ];
           });
@@ -1211,91 +1243,30 @@ function App() {
           videoObjectUrls.current.clear();
           setVideoPreviews([]);
         }
+        if (event.scope === "volume" || event.scope === "all") {
+          setVolumePreviews([]);
+        }
+        if (event.scope === "all") {
+          setGenerationManifest(null);
+        }
+        return;
+      }
+      if (event.type === "volume") {
+        if (event.projections) {
+          const entries = Object.entries(event.projections)
+            .filter(([, value]) => typeof value === "string" && value.length > 0)
+            .map(([orientation, encoded]) => ({
+              id: `${orientation}-${Date.now()}`,
+              orientation,
+              url: `data:${event.mimeType || "image/png"};base64,${encoded}`,
+            }));
+          setVolumePreviews(entries);
+        }
         return;
       }
     },
     [addLogEntry, drawImageToCanvas, i18n]
   );
-
-  useEffect(() => {
-    if (typeof window === "undefined" || typeof window.WebSocket === "undefined") {
-      return () => {};
-    }
-    let isActive = true;
-    let socket;
-    let buffer = "";
-
-    const processBuffer = (payload) => {
-      buffer += payload;
-      const lines = buffer.split(/\n+/);
-      buffer = lines.pop() || "";
-      lines.forEach((line) => {
-        const trimmed = line.trim();
-        if (!trimmed) {
-          return;
-        }
-        try {
-          const parsed = JSON.parse(trimmed);
-          handleStreamEvent(parsed);
-        } catch (error) {
-          console.warn("Failed to parse stream payload", error, trimmed);
-        }
-      });
-    };
-
-    const connect = () => {
-      const protocol = window.location.protocol === "https:" ? "wss" : "ws";
-      const url = `${protocol}://${window.location.host}/generate`;
-      socket = new WebSocket(url);
-      socket.binaryType = "arraybuffer";
-      socket.addEventListener("open", () => {
-        addLogEntry("Connected to generation stream.");
-      });
-      socket.addEventListener("message", (event) => {
-        if (!isActive) {
-          return;
-        }
-        const data = event.data;
-        if (typeof data === "string") {
-          processBuffer(data);
-        } else if (data instanceof ArrayBuffer) {
-          const decoder = new TextDecoder();
-          processBuffer(decoder.decode(new Uint8Array(data)));
-        } else if (data instanceof Blob && typeof data.text === "function") {
-          data
-            .text()
-            .then(processBuffer)
-            .catch((error) => {
-              console.warn("Failed to decode blob payload", error);
-            });
-        }
-      });
-      socket.addEventListener("error", (error) => {
-        console.error("WebSocket error", error);
-        addLogEntry("WebSocket error while reading generation stream.", "error");
-      });
-      socket.addEventListener("close", () => {
-        if (!isActive) {
-          return;
-        }
-        addLogEntry("Disconnected from generation stream.", "warn");
-        setTimeout(() => {
-          if (isActive) {
-            connect();
-          }
-        }, 1500);
-      });
-    };
-
-    connect();
-
-    return () => {
-      isActive = false;
-      if (socket && socket.readyState === WebSocket.OPEN) {
-        socket.close();
-      }
-    };
-  }, [addLogEntry, handleStreamEvent]);
 
   const previousModelRef = useRef(model);
   useEffect(() => {
@@ -1802,6 +1773,21 @@ function App() {
                 </div>
               ))
             )}
+            <div className="volume-projections">
+              <h4>{i18n.volumePreviewTitle}</h4>
+              {volumePreviews.length === 0 ? (
+                <p>{i18n.volumePreviewEmpty}</p>
+              ) : (
+                <div className="projection-grid">
+                  {volumePreviews.map((projection) => (
+                    <figure key={projection.id}>
+                      <img src={projection.url} alt={`${projection.orientation} projection`} />
+                      <figcaption>{projection.orientation.toUpperCase()}</figcaption>
+                    </figure>
+                  ))}
+                </div>
+              )}
+            </div>
           </section>
           <section className="video-panel" aria-label={i18n.videoPanelTitle}>
             <h3>{i18n.videoPanelTitle}</h3>
@@ -1823,16 +1809,20 @@ function App() {
                   }}
                 >
                   <h4>{preview.label || i18n.videoItemLabel(index)}</h4>
-                  <video
-                    controls
-                    src={preview.url}
-                    poster={preview.poster || undefined}
-                    ref={registerVideoRef(preview.id)}
-                    onPlay={() => setActiveVideoId(preview.id)}
-                    onClick={() => setActiveVideoId(preview.id)}
-                  >
-                    Your browser does not support the video element.
-                  </video>
+                  {preview.kind === "image" ? (
+                    <img src={preview.url} alt={preview.label} />
+                  ) : (
+                    <video
+                      controls
+                      src={preview.url}
+                      poster={preview.poster || undefined}
+                      ref={registerVideoRef(preview.id)}
+                      onPlay={() => setActiveVideoId(preview.id)}
+                      onClick={() => setActiveVideoId(preview.id)}
+                    >
+                      Your browser does not support the video element.
+                    </video>
+                  )}
                 </div>
               ))
             )}
@@ -1871,6 +1861,28 @@ function App() {
                   schedulerFallback.previous,
                   schedulerFallback.fallback,
                   schedulerFallback.model
+                )}
+              </div>
+            )}
+            {generationManifest && (
+              <div className="manifest-panel">
+                <h3>{i18n.manifestTitle}</h3>
+                <ul>
+                  {Object.entries(generationManifest.artifacts || {}).map(([modality, info]) => (
+                    <li key={modality}>
+                      <strong>{modality}:</strong>{" "}
+                      {Array.isArray(info.shape) ? info.shape.join(" × ") : ""}{" "}
+                      {info.dtype || ""}
+                    </li>
+                  ))}
+                </ul>
+                {generationManifest.metadata && generationManifest.metadata.metrics && (
+                  <p>
+                    {i18n.manifestTimingLabel(
+                      generationManifest.metadata.metrics.wall_clock_s_total?.toFixed(2) || "0",
+                      generationManifest.metadata.metrics.wall_clock_s_elapsed?.toFixed(2) || "0"
+                    )}
+                  </p>
                 )}
               </div>
             )}
