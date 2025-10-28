@@ -264,6 +264,12 @@ def _stream_bundle_events(
         yield json.dumps({"type": "complete", "manifest": manifest}) + "\n"
     finally:
         cancellation_registry.release(token_id)
+        },
+    }
+    benchmark = engine.last_benchmark
+    if benchmark:
+        manifest["metadata"]["metrics"]["scalability"] = _normalise_metadata(benchmark)
+    yield json.dumps({"type": "complete", "manifest": manifest}) + "\n"
 
 
 def create_app() -> FastAPI:
