@@ -213,6 +213,7 @@ def _stream_bundle_events(
     total_wall = 0.0
     artifacts: Dict[str, Any] = {}
     start = time.perf_counter()
+    manifest: Optional[Dict[str, Any]] = None
 
     try:
         yield json.dumps({"type": "info", "cancel_token": token_id}) + "\n"
@@ -261,15 +262,14 @@ def _stream_bundle_events(
                 },
             },
         }
+
+        benchmark = getattr(engine, "last_benchmark", None)
+        if benchmark:
+            manifest["metadata"]["metrics"]["scalability"] = _normalise_metadata(benchmark)
+
         yield json.dumps({"type": "complete", "manifest": manifest}) + "\n"
     finally:
         cancellation_registry.release(token_id)
-        },
-    }
-    benchmark = engine.last_benchmark
-    if benchmark:
-        manifest["metadata"]["metrics"]["scalability"] = _normalise_metadata(benchmark)
-    yield json.dumps({"type": "complete", "manifest": manifest}) + "\n"
 
 
 def create_app() -> FastAPI:
