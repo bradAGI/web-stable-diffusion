@@ -9,7 +9,9 @@ import threading
 import time
 import uuid
 import wave
-from typing import Any, Dict, Iterable, Iterator, Mapping, Optional, Tuple
+from collections import OrderedDict
+from copy import deepcopy
+from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Tuple
 
 import numpy as np
 from PIL import Image
@@ -265,8 +267,95 @@ class EngineManager:
             return {"healthy": self._healthy, "last_failure": self._last_failure}
 
 
+class ManifestRegistry:
+    """Stores recent generation manifests and error payloads."""
+
+    def __init__(self, max_entries: int = 512) -> None:
+        self._lock = threading.Lock()
+        self._entries: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+        self._max_entries = max_entries
+
+    @staticmethod
+    def _timestamp() -> str:
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+    def _evict_if_needed(self) -> None:
+        while len(self._entries) > self._max_entries:
+            self._entries.popitem(last=False)
+
+    def start(self, token_id: str, request: Mapping[str, Any]) -> None:
+        entry = {
+            "token": token_id,
+            "status": "pending",
+            "created_at": self._timestamp(),
+            "updated_at": self._timestamp(),
+            "request": dict(request),
+        }
+        with self._lock:
+            self._entries[token_id] = entry
+            self._entries.move_to_end(token_id)
+            self._evict_if_needed()
+
+    def record_complete(self, token_id: str, manifest: Mapping[str, Any]) -> None:
+        with self._lock:
+            entry = self._entries.setdefault(
+                token_id,
+                {
+                    "token": token_id,
+                    "created_at": self._timestamp(),
+                    "request": {},
+                },
+            )
+            entry["status"] = "complete"
+            entry["manifest"] = dict(manifest)
+            entry.pop("error", None)
+            entry["updated_at"] = self._timestamp()
+            self._entries.move_to_end(token_id)
+            self._evict_if_needed()
+
+    def record_error(self, token_id: str, payload: Mapping[str, Any]) -> None:
+        with self._lock:
+            entry = self._entries.setdefault(
+                token_id,
+                {
+                    "token": token_id,
+                    "created_at": self._timestamp(),
+                    "request": {},
+                },
+            )
+            entry["status"] = "error"
+            entry["error"] = dict(payload)
+            entry.pop("manifest", None)
+            entry["updated_at"] = self._timestamp()
+            self._entries.move_to_end(token_id)
+            self._evict_if_needed()
+
+    def get(self, token_id: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            entry = self._entries.get(token_id)
+            if entry is None:
+                return None
+            return deepcopy(entry)
+
+    def delete(self, token_id: str) -> bool:
+        with self._lock:
+            try:
+                self._entries.pop(token_id)
+            except KeyError:
+                return False
+            return True
+
+    def list(self, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+        with self._lock:
+            items = list(self._entries.values())
+            if limit is not None and limit >= 0:
+                items = items[-limit:]
+            return [deepcopy(item) for item in reversed(items)]
+
+
 cancellation_registry = CancellationRegistry()
 engine_manager = EngineManager()
+manifest_registry = ManifestRegistry()
 
 
 def _error_response(exc: Exception) -> Dict[str, Any]:
@@ -331,6 +420,7 @@ def _stream_bundle_events(
     manifest: Optional[Dict[str, Any]] = None
 
     try:
+        manifest_registry.start(token_id, request.model_dump(mode="json"))
         yield json.dumps({"type": "info", "cancel_token": token_id}) + "\n"
         for event in engine.generate_bundle_iter(
             **request.generation_kwargs(),
@@ -350,12 +440,16 @@ def _stream_bundle_events(
             yield json.dumps(payload) + "\n"
     except (GenerationCancelled, BudgetExceededError, TimeoutError) as exc:
         logger.warning("Streaming generation aborted: %s", exc)
-        yield json.dumps(_error_response(exc)) + "\n"
+        error_payload = _error_response(exc)
+        manifest_registry.record_error(token_id, error_payload)
+        yield json.dumps(error_payload) + "\n"
         return
     except Exception as exc:  # pragma: no cover - defensive
         logger.error("Streaming generation failed: %s", exc, exc_info=True)
         engine_manager.mark_unhealthy(str(exc))
-        yield json.dumps(_error_response(exc)) + "\n"
+        error_payload = _error_response(exc)
+        manifest_registry.record_error(token_id, error_payload)
+        yield json.dumps(error_payload) + "\n"
         return
     else:
         engine_manager.mark_healthy()
@@ -382,6 +476,7 @@ def _stream_bundle_events(
         if benchmark:
             manifest["metadata"]["metrics"]["scalability"] = _normalise_metadata(benchmark)
 
+        manifest_registry.record_complete(token_id, manifest)
         yield json.dumps({"type": "complete", "manifest": manifest}) + "\n"
     finally:
         cancellation_registry.release(token_id)
@@ -415,6 +510,26 @@ def create_app() -> FastAPI:
         except KeyError as exc:  # pragma: no cover - defensive
             raise HTTPException(status_code=404, detail="unknown cancellation token") from exc
         return {"status": "cancelled", "token": token_id}
+
+    @app.get("/manifests/{token_id}")
+    def get_manifest(token_id: str) -> Dict[str, Any]:
+        record = manifest_registry.get(token_id)
+        if record is None:
+            raise HTTPException(status_code=404, detail="unknown manifest token")
+        return record
+
+    @app.delete("/manifests/{token_id}")
+    def delete_manifest(token_id: str) -> Dict[str, Any]:
+        removed = manifest_registry.delete(token_id)
+        if not removed:
+            raise HTTPException(status_code=404, detail="unknown manifest token")
+        return {"status": "deleted", "token": token_id}
+
+    @app.get("/manifests")
+    def list_manifests(limit: int = 20) -> Dict[str, Any]:
+        if limit < 0:
+            raise HTTPException(status_code=422, detail={"message": "limit must be non-negative"})
+        return {"items": manifest_registry.list(limit=limit)}
 
     @app.get("/healthz")
     def healthcheck() -> Dict[str, Any]:

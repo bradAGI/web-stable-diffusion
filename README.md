@@ -81,6 +81,14 @@ final manifest.  This enables terminals, dashboards, or WebSocket bridges to
 render progress bars, previews, or alerts in real time without waiting for the
 entire bundle to finish.
 
+Each request announces a cancellation token in the first event. The backend now
+persists the outcome of the run—successful manifests as well as structured
+error payloads—under this token. Operators can query recent results at
+`GET /manifests/{token}` (or list them via `GET /manifests`) to integrate with
+job trackers and observability pipelines, and reclaim storage with
+`DELETE /manifests/{token}` once downstream systems finish processing the
+artefacts.
+
 ### Browser-first omni-modal experience
 
 The React single-page application under `web/` now speaks to the same streaming

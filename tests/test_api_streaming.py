@@ -4,13 +4,29 @@ import base64
 import io
 import json
 import wave
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 import numpy as np
 from PIL import Image, ImageSequence
 from fastapi.testclient import TestClient
 
 from web_stable_diffusion.runtime.api import create_app
+
+
+def _collect_stream(client: TestClient, payload: Dict[str, object]) -> Tuple[List[Dict[str, object]], str]:
+    token_id = ""
+    events: List[Dict[str, object]] = []
+    with client.stream("POST", "/generate", json=payload) as response:
+        assert response.status_code == 200
+        for line in response.iter_lines():
+            if not line:
+                continue
+            event = json.loads(line)
+            if event.get("type") == "info" and event.get("cancel_token"):
+                token_id = event["cancel_token"]
+            events.append(event)
+    assert token_id, "Streaming API did not return a cancellation token"
+    return events, token_id
 
 
 def _decode_png(encoded: str) -> Image.Image:
@@ -27,15 +43,10 @@ def _decode_wav(encoded: str) -> wave.Wave_read:
 def test_streaming_api_emits_all_modalities() -> None:
     client = TestClient(create_app())
 
-    with client.stream(
-        "POST",
-        "/generate",
-        json={"prompt": "orchestral sunrise", "frames": 4, "audio_length": 128},
-    ) as response:
-        assert response.status_code == 200
-        events: List[Dict[str, object]] = [
-            json.loads(line) for line in response.iter_lines() if line
-        ]
+    events, token_id = _collect_stream(
+        client,
+        {"prompt": "orchestral sunrise", "frames": 4, "audio_length": 128},
+    )
 
     modality_events = [event for event in events if event["type"] == "modality"]
     assert len(modality_events) == 4
@@ -83,6 +94,23 @@ def test_streaming_api_emits_all_modalities() -> None:
     assert metrics["wall_clock_s_total"] >= 0.0
     assert metrics["wall_clock_s_elapsed"] >= 0.0
 
+    manifest_response = client.get(f"/manifests/{token_id}")
+    assert manifest_response.status_code == 200
+    manifest_entry = manifest_response.json()
+    assert manifest_entry["status"] == "complete"
+    assert manifest_entry["token"] == token_id
+    assert manifest_entry["manifest"]["artifacts"] == manifest["artifacts"]
+    assert manifest_entry["request"]["prompt"] == "orchestral sunrise"
+
+    listing = client.get("/manifests", params={"limit": 1})
+    assert listing.status_code == 200
+    items = listing.json()["items"]
+    assert any(item["token"] == token_id for item in items)
+
+    delete_response = client.delete(f"/manifests/{token_id}")
+    assert delete_response.status_code == 200
+    assert client.get(f"/manifests/{token_id}").status_code == 404
+
 
 def test_streaming_api_rejects_invalid_executor() -> None:
     client = TestClient(create_app())
@@ -91,3 +119,25 @@ def test_streaming_api_rejects_invalid_executor() -> None:
         json={"prompt": "hello", "executor": "invalid"},
     )
     assert response.status_code == 422
+
+
+def test_manifest_registry_records_errors() -> None:
+    client = TestClient(create_app())
+    events, token_id = _collect_stream(
+        client,
+        {
+            "prompt": "budget bust",
+            "frames": 2,
+            "audio_length": 32,
+            "budgets": {"default": {"memory_bytes": 1}},
+        },
+    )
+
+    last = events[-1]
+    assert last["type"] == "error"
+    record_response = client.get(f"/manifests/{token_id}")
+    assert record_response.status_code == 200
+    record = record_response.json()
+    assert record["status"] == "error"
+    assert record["error"]["code"] == "budget_exceeded"
+    assert record["request"]["prompt"] == "budget bust"
