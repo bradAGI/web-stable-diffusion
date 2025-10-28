@@ -93,8 +93,13 @@ artefacts.
 
 The React single-page application under `web/` now speaks to the same streaming
 endpoint. Launch the FastAPI service locally and run `make serve` (or host the
-static files from `site/dist/`) to see the omni-modal engine in action. As each
-modality completes the UI:
+static files from `site/dist/`) to see the omni-modal engine in action. Provide
+the backend address via `window.__omnimodalApiConfig = { baseUrl: "http://127.0.0.1:8000" }`
+or by persisting `omnimodal.apiBaseUrl` in `localStorage`; when the page is
+served from `localhost` the UI automatically defaults to `http://127.0.0.1:8000`.
+If the handshake fails the application records the error and transparently falls
+back to the legacy `tvmjsGlobalEnv` pipeline so offline demos remain functional.
+As each modality completes the UI:
 
 * paints the image tensor onto the preview canvas,
 * converts the synthetic waveform into an interactive `<audio>` element, complete
