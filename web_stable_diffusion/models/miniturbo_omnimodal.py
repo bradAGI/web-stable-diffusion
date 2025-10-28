@@ -23,6 +23,7 @@ import itertools
 import logging
 import math
 import multiprocessing
+import os
 import threading
 import time
 from dataclasses import dataclass
@@ -663,6 +664,27 @@ class OmniModalMiniturbo:
                 return False
         return False
 
+    def _suggest_worker_count(
+        self,
+        requested: Optional[int],
+        task_count: int,
+        use_process_executor: bool,
+    ) -> int:
+        """Return a bounded worker count honouring user input and CPU topology."""
+
+        if requested is not None:
+            return self._ensure_positive(requested, "max_workers", minimum=1)
+
+        detected_cpus = os.cpu_count()
+        if not detected_cpus or detected_cpus <= 0:
+            return max(1, task_count)
+
+        if use_process_executor:
+            usable = max(1, detected_cpus - 1)
+            return max(1, min(task_count, usable))
+
+        return max(1, min(task_count, detected_cpus))
+
     # -- Parallel orchestration -------------------------------------------
     def generate_bundle_iter(
         self,
@@ -706,7 +728,7 @@ class OmniModalMiniturbo:
             ),
         }
 
-        worker_count = max(1, max_workers or len(tasks))
+        task_count = len(tasks)
         deadline = time.perf_counter() + timeout if timeout is not None else None
 
         def remaining_timeout() -> Optional[float]:
@@ -734,6 +756,8 @@ class OmniModalMiniturbo:
         elif exec_mode == "auto":
             use_process = supports_ipc or self.device_spec.backend == BACKEND_NUMPY
 
+        worker_count = self._suggest_worker_count(max_workers, task_count, use_process)
+
         if use_process:
             ctx = multiprocessing.get_context("spawn")
             executor_cls = concurrent.futures.ProcessPoolExecutor
@@ -753,6 +777,8 @@ class OmniModalMiniturbo:
             "requested_executor": exec_mode,
             "fallback_to_threads": fallback_to_threads,
             "max_workers": worker_count,
+            "requested_max_workers": max_workers,
+            "cpu_count": os.cpu_count(),
             "device": {"backend": self.device_spec.backend, "device": self.device_spec.device},
             "supports_cuda_ipc": supports_ipc,
             "queue_policy": "work-stealing",
