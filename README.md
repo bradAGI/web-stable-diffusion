@@ -81,6 +81,24 @@ final manifest.  This enables terminals, dashboards, or WebSocket bridges to
 render progress bars, previews, or alerts in real time without waiting for the
 entire bundle to finish.
 
+### Browser-first omni-modal experience
+
+The React single-page application under `web/` now speaks to the same streaming
+endpoint. Launch the FastAPI service locally and run `make serve` (or host the
+static files from `site/dist/`) to see the omni-modal engine in action. As each
+modality completes the UI:
+
+* paints the image tensor onto the preview canvas,
+* converts the synthetic waveform into an interactive `<audio>` element, complete
+  with segment-aware gain controls,
+* assembles the video frames into an animated preview, automatically falling
+  back to GIF playback when no native video encoder is available, and
+* visualises volumetric data via orthogonal maximum-intensity projections.
+
+In addition, the telemetry panel captures the JSON manifest emitted by the
+backend, summarising tensor shapes, dtypes, and wall-clock timing so that the
+browser experience stays aligned with the CLI and automated tests.
+
 <img src="site/img/fig/browser-screenshot.png" alt="Browser screenshot"/>
 
 We have been seeing amazing progress through AI models recently. Thanks to the open-source effort, developers can now easily compose open-source models together to produce amazing tasks. Stable diffusion enables the automatic creation of photorealistic images as well as images in various styles based on text input. These models are usually big and compute-heavy, which means we have to pipe through all computation requests to (GPU) servers when developing web applications based on these models. Additionally, most of the workloads have to run on a specific type of GPUs where popular deep-learning frameworks are readily available.

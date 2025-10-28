@@ -8,9 +8,11 @@ import logging
 import threading
 import time
 import uuid
-from typing import Any, Dict, Iterator, Mapping, Optional, Tuple
+import wave
+from typing import Any, Dict, Iterable, Iterator, Mapping, Optional, Tuple
 
 import numpy as np
+from PIL import Image
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator
@@ -40,11 +42,103 @@ def _normalise_metadata(value: Any) -> Any:
     return value
 
 
-def _event_payload(event: BundleEvent, array: np.ndarray) -> Dict[str, Any]:
+def _encode_image_payload(array: np.ndarray) -> Tuple[str, str]:
+    if array.ndim == 2:
+        rgb = np.stack([array] * 3, axis=-1)
+    elif array.ndim == 3 and array.shape[-1] in (1, 3, 4):
+        if array.shape[-1] == 1:
+            rgb = np.repeat(array, 3, axis=-1)
+        elif array.shape[-1] == 3:
+            rgb = array
+        else:
+            rgb = array[..., :3]
+    else:
+        raise ValueError(f"Unsupported image tensor shape {array.shape}")
+    normalised = np.clip(rgb, 0.0, 1.0)
+    uint8 = (normalised * 255.0).astype(np.uint8)
     buffer = io.BytesIO()
-    np.savez_compressed(buffer, payload=array)
-    encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+    Image.fromarray(uint8).save(buffer, format="PNG")
+    return base64.b64encode(buffer.getvalue()).decode("ascii"), "image/png"
+
+
+def _encode_audio_payload(array: np.ndarray, sample_rate: int = 22_050) -> Tuple[str, str, Iterable[Dict[str, float]]]:
+    flattened = np.asarray(array).astype(np.float32).reshape(-1)
+    peak = float(np.max(np.abs(flattened)) or 1.0)
+    normalised = np.clip(flattened / peak, -1.0, 1.0)
+    pcm = (normalised * 32767).astype(np.int16)
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(sample_rate)
+        wav.writeframes(pcm.tobytes())
+
+    segment_count = max(4, min(16, len(pcm) // 256))
+    samples_per_segment = max(1, len(pcm) // segment_count)
+    slices = []
+    for index in range(segment_count):
+        start_idx = index * samples_per_segment
+        end_idx = min(len(pcm), (index + 1) * samples_per_segment)
+        if end_idx <= start_idx:
+            continue
+        window = normalised[start_idx:end_idx]
+        rms = float(np.sqrt(np.mean(window**2))) if window.size else 0.0
+        slices.append(
+            {
+                "index": index,
+                "start": start_idx / float(sample_rate),
+                "end": end_idx / float(sample_rate),
+                "volume": float(min(1.0, rms * 1.5)),
+            }
+        )
+
+    return base64.b64encode(buffer.getvalue()).decode("ascii"), "audio/wav", slices
+
+
+def _encode_volume_payload(array: np.ndarray) -> Dict[str, Any]:
+    tensor = np.asarray(array).astype(np.float32)
+    projections = {}
+    axes = {"xy": 0, "xz": 1, "yz": 2}
+    for name, axis in axes.items():
+        projection = np.max(tensor, axis=axis)
+        normalised = np.clip(projection / (projection.max() or 1.0), 0.0, 1.0)
+        uint8 = (normalised * 255.0).astype(np.uint8)
+        buffer = io.BytesIO()
+        Image.fromarray(uint8).save(buffer, format="PNG")
+        projections[name] = base64.b64encode(buffer.getvalue()).decode("ascii")
     return {
+        "type": "modality",
+        "modality": "volume",
+        "encoding": "base64",
+        "mime_type": "image/png",
+        "projections": projections,
+    }
+
+
+def _encode_video_payload(array: np.ndarray, *, duration_ms: int = 100) -> Tuple[str, str]:
+    frames = np.asarray(array).astype(np.float32)
+    if frames.ndim != 4:
+        raise ValueError(f"Unsupported video tensor shape {frames.shape}")
+    frame_images = []
+    for frame in frames:
+        data = np.clip(frame, 0.0, 1.0)
+        uint8 = (data * 255.0).astype(np.uint8)
+        frame_images.append(Image.fromarray(uint8))
+    buffer = io.BytesIO()
+    frame_images[0].save(
+        buffer,
+        format="GIF",
+        save_all=True,
+        append_images=frame_images[1:],
+        duration=duration_ms,
+        loop=0,
+        disposal=2,
+    )
+    return base64.b64encode(buffer.getvalue()).decode("ascii"), "image/gif"
+
+
+def _event_payload(event: BundleEvent, array: np.ndarray) -> Dict[str, Any]:
+    base = {
         "type": "modality",
         "modality": event.key,
         "duration_s": event.duration_s,
@@ -56,8 +150,29 @@ def _event_payload(event: BundleEvent, array: np.ndarray) -> Dict[str, Any]:
         "backend": event.result.backend,
         "device": event.result.device,
         "metadata": _normalise_metadata(event.result.metadata),
-        "payload": encoded,
     }
+
+    if event.key == "image":
+        payload, mime = _encode_image_payload(array)
+        base.update({"encoding": "base64", "mime_type": mime, "payload": payload})
+    elif event.key == "audio":
+        payload, mime, slices = _encode_audio_payload(array)
+        base.update(
+            {
+                "encoding": "base64",
+                "mime_type": mime,
+                "payload": payload,
+                "slices": _normalise_metadata(list(slices)),
+            }
+        )
+    elif event.key == "video":
+        payload, mime = _encode_video_payload(array)
+        base.update({"encoding": "base64", "mime_type": mime, "payload": payload})
+    elif event.key == "volume":
+        base.update(_encode_volume_payload(array))
+    else:
+        base.update({"encoding": "json", "payload": array.tolist()})
+    return base
 
 
 class BudgetSpec(BaseModel):

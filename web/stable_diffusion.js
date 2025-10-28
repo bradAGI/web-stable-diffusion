@@ -1695,8 +1695,160 @@ class StableDiffusionInstance {
 
 localStableDiffusionInst = new StableDiffusionInstance();
 
+async function streamOmniModalBackend() {
+  const promptCandidate = callUIHook("getPrompt");
+  const prompt = typeof promptCandidate === "string" ? promptCandidate.trim() : "";
+  if (!prompt) {
+    const message = "Prompt is required.";
+    callUIHook("reportValidationError", { field: "prompt", message: message });
+    const error = new Error(message);
+    error.validation = true;
+    throw error;
+  }
+
+  const requestBody = {
+    prompt: prompt,
+    resolution: 256,
+    frames: 16,
+    volume_size: 32,
+    audio_length: 2048,
+    executor: "auto",
+  };
+
+  const { protocol, host } = window.location;
+  const baseUrl = `${protocol}//${host}`;
+  const url = `${baseUrl}/generate`;
+
+  callUIHook("handleStreamEvent", { type: "clear", scope: "all" });
+  callUIHook("onGenerationLifecycle", "start");
+  callUIHook("clearValidationErrors");
+  callUIHook("updateProgress", { text: "Submitting omni-modal request…", progress: 0, stage: "start" });
+  callUIHook("logMessage", "Submitting prompt to omni-modal backend.");
+
+  const decoder = new TextDecoder();
+  let cancelToken = null;
+
+  function emitProgress(modalityEvent, message) {
+    callUIHook("updateProgress", {
+      text: message,
+      stage: modalityEvent.modality,
+      progress: modalityEvent.progress,
+    });
+    callUIHook("logMessage", message);
+  }
+
+  function emitModality(modalityEvent) {
+    const label = `${modalityEvent.modality} ${modalityEvent.completed}/${modalityEvent.total}`;
+    emitProgress(modalityEvent, `Received ${label}.`);
+    const payload = {
+      type:
+        modalityEvent.modality === "audio"
+          ? "audio"
+          : modalityEvent.modality === "video"
+          ? "video"
+          : modalityEvent.modality === "volume"
+          ? "volume"
+          : "image",
+      id: `${modalityEvent.modality}-${modalityEvent.completed}-${Date.now()}`,
+      mimeType: modalityEvent.mime_type,
+      encoding: modalityEvent.encoding,
+      data: modalityEvent.payload,
+      slices: modalityEvent.slices,
+      projections: modalityEvent.projections,
+      metadata: modalityEvent.metadata,
+      label: label,
+    };
+    callUIHook("handleStreamEvent", payload);
+  }
+
+  try {
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(requestBody),
+    });
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(`Generation request failed (${response.status}): ${text}`);
+    }
+
+    const reader = response.body.getReader();
+    let buffer = "";
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) {
+        break;
+      }
+      buffer += decoder.decode(value, { stream: true });
+      let newlineIndex = buffer.indexOf("\n");
+      while (newlineIndex !== -1) {
+        const line = buffer.slice(0, newlineIndex).trim();
+        buffer = buffer.slice(newlineIndex + 1);
+        if (line) {
+          let parsed;
+          try {
+            parsed = JSON.parse(line);
+          } catch (err) {
+            console.warn("Failed to parse backend payload", err, line);
+            parsed = null;
+          }
+          if (parsed) {
+            if (parsed.type === "info") {
+              cancelToken = parsed.cancel_token || cancelToken;
+              if (parsed.cancel_token) {
+                callUIHook("logMessage", `Cancellation token: ${parsed.cancel_token}`);
+              }
+              continue;
+            }
+            if (parsed.type === "modality") {
+              emitModality(parsed);
+              continue;
+            }
+            if (parsed.type === "complete") {
+              callUIHook("updateProgress", {
+                text: "Generation complete.",
+                progress: 1,
+                stage: "complete",
+              });
+              callUIHook("handleStreamEvent", { type: "manifest", manifest: parsed.manifest });
+              callUIHook("onGenerationLifecycle", "complete");
+              callUIHook("handleStreamEvent", { type: "lifecycle", stage: "complete" });
+              return;
+            }
+            if (parsed.type === "error") {
+              const message = parsed.message || "Generation failed.";
+              callUIHook("logMessage", message, "error");
+              callUIHook("onGenerationLifecycle", "error");
+              callUIHook("handleStreamEvent", { type: "lifecycle", stage: "error" });
+              throw new Error(message);
+            }
+          }
+        }
+        newlineIndex = buffer.indexOf("\n");
+      }
+    }
+    callUIHook("onGenerationLifecycle", "complete");
+    callUIHook("handleStreamEvent", { type: "lifecycle", stage: "complete" });
+  } catch (error) {
+    if (error && error.validation) {
+      callUIHook("onGenerationLifecycle", "validation-error");
+    } else {
+      callUIHook("onGenerationLifecycle", "error");
+      const message = error && error.message ? error.message : "Generation failed.";
+      callUIHook("logMessage", message, "error");
+      callUIHook("updateProgress", { text: message, progress: 1, stage: "error" });
+    }
+    throw error;
+  } finally {
+    callUIHook("onGenerationLifecycle", "end");
+    if (cancelToken) {
+      callUIHook("logMessage", `Use /cancel/${cancelToken} to abort server-side generation if needed.`, "info");
+    }
+  }
+}
+
 tvmjsGlobalEnv.asyncOnGenerate = async function () {
-  await localStableDiffusionInst.generate();
+  await streamOmniModalBackend();
 };
 
 tvmjsGlobalEnv.asyncOnRPCServerLoad = async function (tvm) {
