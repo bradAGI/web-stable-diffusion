@@ -48,3 +48,6 @@ def test_concurrent_generation_requests_stay_isolated(api_security_env: None) ->
         metrics = manifest.get("metadata", {}).get("metrics", {})
         assert metrics.get("wall_clock_s_total", 0.0) >= 0.0
         assert metrics.get("wall_clock_s_elapsed", 0.0) >= 0.0
+        scheduler = metrics["scheduler"]
+        assert scheduler["modalities_completed"] == 4
+        assert scheduler["worker_count"] >= 1

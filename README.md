@@ -9,6 +9,7 @@ You are also more than welcomed to checkout [Web LLM](https://github.com/mlc-ai/
 > * The neuro-symbolic `OmniModalMiniturbo` engine can now delegate image synthesis to a real [🤗 Diffusers](https://github.com/huggingface/diffusers) pipeline when a model checkpoint is available. Set `OMNIMODAL_DIFFUSERS_MODEL` to a local or remote model identifier and install the optional dependencies (`diffusers`, `torch`, and any scheduler plugins) to enable photorealistic decoding. The symbolic generator remains available as a deterministic fallback for lightweight testing.
 > * Generated manifests are written to a durable SQLite store (`OMNIMODAL_MANIFEST_DB`) so results survive process restarts and can be audited later.
 > * The streaming API now enforces API-key authentication (`X-API-Key`) and fixed-window rate limiting (`OMNIMODAL_RATE_LIMIT`/`OMNIMODAL_RATE_PERIOD`) to make deployments safer on shared infrastructure.
+> * Generated manifests expose a summarised scheduler report (modalities completed, worker utilisation, transport mix) alongside the full benchmark payload so dashboards and tests can reason about concurrency without parsing implementation-specific fields.
 >
 > See [docs/omnimodal.md](docs/omnimodal.md) for the architectural roadmap and additional hardening guidance.
 
