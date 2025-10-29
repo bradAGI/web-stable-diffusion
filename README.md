@@ -1,10 +1,16 @@
 # Web Stable Diffusion
 
-This project brings stable diffusion models onto web browsers. **Everything runs inside the browser with no server support.** To our knowledge, this is the world’s first stable diffusion completely running on the browser. Please checkout our [demo webpage](https://websd.mlc.ai/#text-to-image-generation-demo) to try it out.
+This project started as an experiment to bring stable diffusion models into the browser. The original WebGPU demo still runs fully client-side, but the modern omni-modal workflow combines a Python runtime with a FastAPI streaming service that powers the React UI. The backend now exposes production-facing features such as persistent manifests, authentication, and rate limiting so the system can be deployed behind an API gateway or automation harness.
 
 You are also more than welcomed to checkout [Web LLM](https://github.com/mlc-ai/web-llm) if you are interested in deploying LLM-based chat bots to browser.
 
-> **New:** the library now ships a neuro-symbolic `OmniModalMiniturbo` engine that performs parallel audio, image, video, and volumetric synthesis guided by a lambda-calculus reasoning core.  The implementation remains a deterministic demonstration model designed for fast experimentation rather than photorealistic diffusion—see [docs/omnimodal.md](docs/omnimodal.md) for architecture notes and roadmap.
+> **New:**
+>
+> * The neuro-symbolic `OmniModalMiniturbo` engine can now delegate image synthesis to a real [🤗 Diffusers](https://github.com/huggingface/diffusers) pipeline when a model checkpoint is available. Set `OMNIMODAL_DIFFUSERS_MODEL` to a local or remote model identifier and install the optional dependencies (`diffusers`, `torch`, and any scheduler plugins) to enable photorealistic decoding. The symbolic generator remains available as a deterministic fallback for lightweight testing.
+> * Generated manifests are written to a durable SQLite store (`OMNIMODAL_MANIFEST_DB`) so results survive process restarts and can be audited later.
+> * The streaming API now enforces API-key authentication (`X-API-Key`) and fixed-window rate limiting (`OMNIMODAL_RATE_LIMIT`/`OMNIMODAL_RATE_PERIOD`) to make deployments safer on shared infrastructure.
+>
+> See [docs/omnimodal.md](docs/omnimodal.md) for the architectural roadmap and additional hardening guidance.
 
 ### Prototype omni-modal hardware requirements
 

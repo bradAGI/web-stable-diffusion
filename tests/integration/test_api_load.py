@@ -14,14 +14,15 @@ from web_stable_diffusion.runtime.api import create_app
 
 
 def _collect_events(payload: Dict[str, object]) -> Dict[str, object]:
-    client = TestClient(create_app())
-    with client.stream("POST", "/generate", json=payload) as response:
-        assert response.status_code == 200
-        events = [json.loads(line) for line in response.iter_lines() if line]
+    with TestClient(create_app()) as client:
+        client.headers.update({"X-API-Key": "test-key"})
+        with client.stream("POST", "/generate", json=payload) as response:
+            assert response.status_code == 200
+            events = [json.loads(line) for line in response.iter_lines() if line]
     return {"events": events, "final": events[-1] if events else {}}
 
 
-def test_concurrent_generation_requests_stay_isolated() -> None:
+def test_concurrent_generation_requests_stay_isolated(api_security_env: None) -> None:
     payload = {
         "prompt": "interstellar gardens",
         "frames": 3,

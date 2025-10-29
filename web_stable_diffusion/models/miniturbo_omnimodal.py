@@ -40,6 +40,15 @@ except Exception:  # pragma: no cover - optional dependency
     _TORCH_AVAILABLE = False
 
 try:  # pragma: no cover - optional dependency
+    from .backends import DiffusersBackendUnavailable, DiffusersImageBackend
+
+    _DIFFUSERS_BACKEND_AVAILABLE = True
+except Exception:  # pragma: no cover - optional dependency
+    DiffusersBackendUnavailable = None  # type: ignore[assignment]
+    DiffusersImageBackend = None  # type: ignore[assignment]
+    _DIFFUSERS_BACKEND_AVAILABLE = False
+
+try:  # pragma: no cover - optional dependency
     import tvm
 
     _TVM_AVAILABLE = True
@@ -406,6 +415,7 @@ class OmniModalMiniturbo:
         self.resource_budgets: Dict[str, ResourceBudget] = base_budgets
         self._last_benchmark: Dict[str, Any] | None = None
         self._decoders: Dict[str, CompiledDecoder] = load_compiled_decoders(self.device_spec)
+        self._image_backend = self._init_image_backend()
 
     # -- Validation helpers -----------------------------------------------
     @staticmethod
@@ -536,20 +546,41 @@ class OmniModalMiniturbo:
             base.setdefault("metrics", {}).update(metrics)
         return base
 
+    def _init_image_backend(self) -> Optional[DiffusersImageBackend]:
+        if not _DIFFUSERS_BACKEND_AVAILABLE or DiffusersImageBackend is None:
+            return None
+        try:
+            backend = DiffusersImageBackend.from_environment()
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("Failed to initialise diffusers backend: %s", exc)
+            return None
+        if backend is None:
+            return None
+        logger.info("Diffusers backend enabled using model '%s'", backend.config.model)
+        return backend
+
     def generate_image(self, prompt: str, resolution: int = 256) -> DeviceAwareResult:
         prompt = self._ensure_prompt(prompt)
         resolution = self._ensure_positive(resolution, "resolution", minimum=16)
         embedding = self._prompt_embedding(prompt, size=12)
         conditioned_embedding, decoder_meta = self._modulate_embedding(prompt, "image", embedding)
-        latent = self._seed_latent(prompt, (resolution, resolution, 3))
-        image = self._diffuse(latent, conditioned_embedding)
-        metadata = {
-            "shape": image.shape,
-            "resolution": resolution,
-            "prompt": prompt,
-            "embedding_norm": float(np.linalg.norm(conditioned_embedding)),
-        }
+        if self._image_backend is not None:
+            backend_result = self._image_backend.generate(prompt, resolution)
+            image = backend_result["array"]
+            metadata = backend_result["metadata"]
+        else:
+            latent = self._seed_latent(prompt, (resolution, resolution, 3))
+            image = self._diffuse(latent, conditioned_embedding)
+            metadata = {
+                "shape": image.shape,
+                "resolution": resolution,
+                "prompt": prompt,
+                "embedding_norm": float(np.linalg.norm(conditioned_embedding)),
+            }
         metadata = self._merge_metadata(metadata, decoder_meta)
+        if self._image_backend is None:
+            metadata.setdefault("backend", "symbolic-diffusion")
+        metadata.setdefault("embedding_norm", float(np.linalg.norm(conditioned_embedding)))
         return _pack_array(image, self.device_spec, metadata)
 
     # -- Volume ------------------------------------------------------------

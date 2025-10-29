@@ -5,17 +5,21 @@ import base64
 import io
 import json
 import logging
+import os
+import sqlite3
 import threading
 import time
 import uuid
 import wave
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from copy import deepcopy
+from pathlib import Path
+from dataclasses import dataclass
 from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Tuple
 
 import numpy as np
 from PIL import Image
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 
@@ -267,95 +271,281 @@ class EngineManager:
             return {"healthy": self._healthy, "last_failure": self._last_failure}
 
 
-class ManifestRegistry:
-    """Stores recent generation manifests and error payloads."""
+class PersistentManifestRegistry:
+    """SQLite-backed manifest store with an in-memory LRU cache."""
 
-    def __init__(self, max_entries: int = 512) -> None:
+    def __init__(self, path: Path, max_entries: int = 512) -> None:
         self._lock = threading.Lock()
-        self._entries: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+        self._path = Path(path)
+        self._cache: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
         self._max_entries = max_entries
+        self._init_db()
 
     @staticmethod
     def _timestamp() -> str:
         return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
-    def _evict_if_needed(self) -> None:
-        while len(self._entries) > self._max_entries:
-            self._entries.popitem(last=False)
+    def _connect(self) -> sqlite3.Connection:
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(self._path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def _init_db(self) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS manifests (
+                    token TEXT PRIMARY KEY,
+                    status TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    request_json TEXT,
+                    manifest_json TEXT,
+                    error_json TEXT
+                )
+                """
+            )
+
+    def _update_cache(self, entry: Dict[str, Any]) -> None:
+        token = entry["token"]
+        self._cache[token] = entry
+        self._cache.move_to_end(token)
+        while len(self._cache) > self._max_entries:
+            self._cache.popitem(last=False)
+
+    @staticmethod
+    def _loads(value: Optional[str]) -> Dict[str, Any]:
+        if not value:
+            return {}
+        return json.loads(value)
+
+    def _row_to_entry(self, row: sqlite3.Row) -> Dict[str, Any]:
+        entry = {
+            "token": row["token"],
+            "status": row["status"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+            "request": self._loads(row["request_json"]),
+        }
+        manifest = self._loads(row["manifest_json"])
+        if manifest:
+            entry["manifest"] = manifest
+        error = self._loads(row["error_json"])
+        if error:
+            entry["error"] = error
+        return entry
+
+    def reconfigure(self, path: Path) -> None:
+        new_path = Path(path)
+        with self._lock:
+            if new_path == self._path:
+                return
+            self._path = new_path
+            self._cache.clear()
+            self._init_db()
 
     def start(self, token_id: str, request: Mapping[str, Any]) -> None:
+        timestamp = self._timestamp()
         entry = {
             "token": token_id,
             "status": "pending",
-            "created_at": self._timestamp(),
-            "updated_at": self._timestamp(),
+            "created_at": timestamp,
+            "updated_at": timestamp,
             "request": dict(request),
         }
-        with self._lock:
-            self._entries[token_id] = entry
-            self._entries.move_to_end(token_id)
-            self._evict_if_needed()
+        payload = json.dumps(entry["request"])
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO manifests(token, status, created_at, updated_at, request_json, manifest_json, error_json)
+                VALUES(?, ?, ?, ?, ?, NULL, NULL)
+                ON CONFLICT(token) DO UPDATE SET
+                    status=excluded.status,
+                    updated_at=excluded.updated_at,
+                    request_json=excluded.request_json,
+                    manifest_json=NULL,
+                    error_json=NULL
+                """,
+                (token_id, entry["status"], timestamp, timestamp, payload),
+            )
+            self._update_cache(entry)
 
     def record_complete(self, token_id: str, manifest: Mapping[str, Any]) -> None:
-        with self._lock:
-            entry = self._entries.setdefault(
-                token_id,
-                {
-                    "token": token_id,
-                    "created_at": self._timestamp(),
-                    "request": {},
-                },
+        timestamp = self._timestamp()
+        manifest_json = json.dumps(dict(manifest))
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO manifests(token, status, created_at, updated_at, request_json, manifest_json, error_json)
+                VALUES(?, 'complete', ?, ?, '{}', ?, NULL)
+                ON CONFLICT(token) DO UPDATE SET
+                    status='complete',
+                    updated_at=excluded.updated_at,
+                    manifest_json=excluded.manifest_json,
+                    error_json=NULL
+                """,
+                (token_id, timestamp, timestamp, manifest_json),
             )
-            entry["status"] = "complete"
-            entry["manifest"] = dict(manifest)
-            entry.pop("error", None)
-            entry["updated_at"] = self._timestamp()
-            self._entries.move_to_end(token_id)
-            self._evict_if_needed()
+            row = conn.execute(
+                "SELECT * FROM manifests WHERE token = ?",
+                (token_id,),
+            ).fetchone()
+            assert row is not None
+            entry = self._row_to_entry(row)
+            self._update_cache(entry)
 
     def record_error(self, token_id: str, payload: Mapping[str, Any]) -> None:
-        with self._lock:
-            entry = self._entries.setdefault(
-                token_id,
-                {
-                    "token": token_id,
-                    "created_at": self._timestamp(),
-                    "request": {},
-                },
+        timestamp = self._timestamp()
+        error_json = json.dumps(dict(payload))
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO manifests(token, status, created_at, updated_at, request_json, manifest_json, error_json)
+                VALUES(?, 'error', ?, ?, '{}', NULL, ?)
+                ON CONFLICT(token) DO UPDATE SET
+                    status='error',
+                    updated_at=excluded.updated_at,
+                    error_json=excluded.error_json,
+                    manifest_json=NULL
+                """,
+                (token_id, timestamp, timestamp, error_json),
             )
-            entry["status"] = "error"
-            entry["error"] = dict(payload)
-            entry.pop("manifest", None)
-            entry["updated_at"] = self._timestamp()
-            self._entries.move_to_end(token_id)
-            self._evict_if_needed()
+            row = conn.execute(
+                "SELECT * FROM manifests WHERE token = ?",
+                (token_id,),
+            ).fetchone()
+            assert row is not None
+            entry = self._row_to_entry(row)
+            self._update_cache(entry)
 
     def get(self, token_id: str) -> Optional[Dict[str, Any]]:
         with self._lock:
-            entry = self._entries.get(token_id)
-            if entry is None:
-                return None
+            cached = self._cache.get(token_id)
+            if cached is not None:
+                return deepcopy(cached)
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM manifests WHERE token = ?",
+                (token_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        entry = self._row_to_entry(row)
+        with self._lock:
+            self._update_cache(entry)
             return deepcopy(entry)
 
     def delete(self, token_id: str) -> bool:
-        with self._lock:
-            try:
-                self._entries.pop(token_id)
-            except KeyError:
-                return False
-            return True
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute("DELETE FROM manifests WHERE token = ?", (token_id,))
+            deleted = cursor.rowcount > 0
+            self._cache.pop(token_id, None)
+            return deleted
 
     def list(self, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+        sql = "SELECT * FROM manifests ORDER BY updated_at DESC"
+        params: Tuple[Any, ...] = ()
+        if limit is not None and limit >= 0:
+            sql += " LIMIT ?"
+            params = (limit,)
+        with self._connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [self._row_to_entry(row) for row in rows]
+
+
+def _default_state_dir() -> Path:
+    override = os.getenv("OMNIMODAL_STATE_DIR")
+    if override:
+        return Path(override)
+    return Path.cwd() / "log_db"
+
+
+def _manifest_db_path() -> Path:
+    override = os.getenv("OMNIMODAL_MANIFEST_DB")
+    if override:
+        return Path(override)
+    return _default_state_dir() / "manifests.db"
+
+
+@dataclass
+class SecurityConfig:
+    api_keys: List[str]
+    rate_limit: int
+    rate_period: float
+
+    @classmethod
+    def from_environment(cls) -> "SecurityConfig":
+        raw_keys = os.getenv("OMNIMODAL_API_KEYS", "")
+        api_keys = [key.strip() for key in raw_keys.split(",") if key.strip()]
+        rate_limit = int(os.getenv("OMNIMODAL_RATE_LIMIT", "60"))
+        rate_period = float(os.getenv("OMNIMODAL_RATE_PERIOD", "60"))
+        return cls(api_keys=api_keys, rate_limit=rate_limit, rate_period=rate_period)
+
+
+class RateLimitExceeded(Exception):
+    def __init__(self, retry_after: float) -> None:
+        super().__init__("rate limit exceeded")
+        self.retry_after = retry_after
+
+
+class RateLimiter:
+    """Simple fixed-window rate limiter keyed by caller identity."""
+
+    def __init__(self, limit: int, period: float) -> None:
+        self.limit = limit
+        self.period = period
+        self._lock = threading.Lock()
+        self._records: Dict[str, deque[float]] = {}
+
+    def reset(self) -> None:
         with self._lock:
-            items = list(self._entries.values())
-            if limit is not None and limit >= 0:
-                items = items[-limit:]
-            return [deepcopy(item) for item in reversed(items)]
+            self._records.clear()
+
+    def check(self, identity: str) -> None:
+        if self.limit <= 0:
+            return
+        now = time.monotonic()
+        with self._lock:
+            history = self._records.setdefault(identity, deque())
+            while history and now - history[0] >= self.period:
+                history.popleft()
+            if len(history) >= self.limit:
+                retry_after = max(0.0, self.period - (now - history[0]))
+                raise RateLimitExceeded(retry_after)
+            history.append(now)
+
+
+def build_api_key_dependency(config: SecurityConfig):
+    async def require_api_key(x_api_key: Optional[str] = Header(default=None)) -> None:
+        if not config.api_keys:
+            return
+        if not x_api_key or x_api_key not in config.api_keys:
+            raise HTTPException(status_code=401, detail={"message": "invalid api key"})
+
+    return require_api_key
+
+
+def build_rate_limit_dependency(limiter: RateLimiter):
+    async def enforce_rate_limit(
+        request: Request,
+        x_api_key: Optional[str] = Header(default=None),
+    ) -> None:
+        identity = x_api_key or (request.client.host if request.client else "anonymous")
+        try:
+            limiter.check(identity)
+        except RateLimitExceeded as exc:
+            raise HTTPException(
+                status_code=429,
+                detail={"message": "rate limit exceeded", "retry_after": round(exc.retry_after, 3)},
+            ) from exc
+
+    return enforce_rate_limit
 
 
 cancellation_registry = CancellationRegistry()
 engine_manager = EngineManager()
-manifest_registry = ManifestRegistry()
+manifest_registry = PersistentManifestRegistry(_manifest_db_path())
 
 
 def _error_response(exc: Exception) -> Dict[str, Any]:
@@ -489,6 +679,15 @@ def create_app() -> FastAPI:
         version="0.1.0",
     )
 
+    manifest_registry.reconfigure(_manifest_db_path())
+    security_config = SecurityConfig.from_environment()
+    rate_limiter = RateLimiter(security_config.rate_limit, security_config.rate_period)
+    api_key_dependency = build_api_key_dependency(security_config)
+    rate_limit_dependency = build_rate_limit_dependency(rate_limiter)
+
+    def _secured_dependencies() -> List[Depends]:
+        return [Depends(api_key_dependency), Depends(rate_limit_dependency)]
+
     @app.on_event("startup")
     async def _startup() -> None:
         try:
@@ -496,14 +695,14 @@ def create_app() -> FastAPI:
         except Exception as exc:  # pragma: no cover - defensive
             logger.error("Startup health check failed: %s", exc)
 
-    @app.post("/generate", response_class=StreamingResponse)
+    @app.post("/generate", response_class=StreamingResponse, dependencies=_secured_dependencies())
     def generate(request: GenerateRequest) -> StreamingResponse:
         token_id, token = cancellation_registry.create()
         budgets = request.budget_overrides()
         stream = _stream_bundle_events(request, token_id, token, budgets or None)
         return StreamingResponse(stream, media_type="application/jsonl")
 
-    @app.post("/cancel/{token_id}")
+    @app.post("/cancel/{token_id}", dependencies=_secured_dependencies())
     def cancel_generation(token_id: str) -> Dict[str, Any]:
         try:
             cancellation_registry.cancel(token_id, reason="api-request")
@@ -511,21 +710,21 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=404, detail="unknown cancellation token") from exc
         return {"status": "cancelled", "token": token_id}
 
-    @app.get("/manifests/{token_id}")
+    @app.get("/manifests/{token_id}", dependencies=_secured_dependencies())
     def get_manifest(token_id: str) -> Dict[str, Any]:
         record = manifest_registry.get(token_id)
         if record is None:
             raise HTTPException(status_code=404, detail="unknown manifest token")
         return record
 
-    @app.delete("/manifests/{token_id}")
+    @app.delete("/manifests/{token_id}", dependencies=_secured_dependencies())
     def delete_manifest(token_id: str) -> Dict[str, Any]:
         removed = manifest_registry.delete(token_id)
         if not removed:
             raise HTTPException(status_code=404, detail="unknown manifest token")
         return {"status": "deleted", "token": token_id}
 
-    @app.get("/manifests")
+    @app.get("/manifests", dependencies=_secured_dependencies())
     def list_manifests(limit: int = 20) -> Dict[str, Any]:
         if limit < 0:
             raise HTTPException(status_code=422, detail={"message": "limit must be non-negative"})
