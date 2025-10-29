@@ -13,6 +13,12 @@ from fastapi.testclient import TestClient
 from web_stable_diffusion.runtime.api import create_app
 
 
+def _build_client() -> TestClient:
+    client = TestClient(create_app())
+    client.headers.update({"X-API-Key": "test-key"})
+    return client
+
+
 def _collect_stream(client: TestClient, payload: Dict[str, object]) -> Tuple[List[Dict[str, object]], str]:
     token_id = ""
     events: List[Dict[str, object]] = []
@@ -40,13 +46,12 @@ def _decode_wav(encoded: str) -> wave.Wave_read:
     return wave.open(buffer)
 
 
-def test_streaming_api_emits_all_modalities() -> None:
-    client = TestClient(create_app())
-
-    events, token_id = _collect_stream(
-        client,
-        {"prompt": "orchestral sunrise", "frames": 4, "audio_length": 128},
-    )
+def test_streaming_api_emits_all_modalities(api_security_env: None) -> None:
+    with _build_client() as client:
+        events, token_id = _collect_stream(
+            client,
+            {"prompt": "orchestral sunrise", "frames": 4, "audio_length": 128},
+        )
 
     modality_events = [event for event in events if event["type"] == "modality"]
     assert len(modality_events) == 4
@@ -112,26 +117,26 @@ def test_streaming_api_emits_all_modalities() -> None:
     assert client.get(f"/manifests/{token_id}").status_code == 404
 
 
-def test_streaming_api_rejects_invalid_executor() -> None:
-    client = TestClient(create_app())
-    response = client.post(
-        "/generate",
-        json={"prompt": "hello", "executor": "invalid"},
-    )
-    assert response.status_code == 422
+def test_streaming_api_rejects_invalid_executor(api_security_env: None) -> None:
+    with _build_client() as client:
+        response = client.post(
+            "/generate",
+            json={"prompt": "hello", "executor": "invalid"},
+        )
+        assert response.status_code == 422
 
 
-def test_manifest_registry_records_errors() -> None:
-    client = TestClient(create_app())
-    events, token_id = _collect_stream(
-        client,
-        {
-            "prompt": "budget bust",
-            "frames": 2,
-            "audio_length": 32,
-            "budgets": {"default": {"memory_bytes": 1}},
-        },
-    )
+def test_manifest_registry_records_errors(api_security_env: None) -> None:
+    with _build_client() as client:
+        events, token_id = _collect_stream(
+            client,
+            {
+                "prompt": "budget bust",
+                "frames": 2,
+                "audio_length": 32,
+                "budgets": {"default": {"memory_bytes": 1}},
+            },
+        )
 
     last = events[-1]
     assert last["type"] == "error"
