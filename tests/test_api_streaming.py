@@ -98,6 +98,10 @@ def test_streaming_api_emits_all_modalities(api_security_env: None) -> None:
     metrics = manifest["metadata"]["metrics"]
     assert metrics["wall_clock_s_total"] >= 0.0
     assert metrics["wall_clock_s_elapsed"] >= 0.0
+    scheduler = metrics["scheduler"]
+    assert scheduler["modalities_completed"] == len(modality_events)
+    assert scheduler["executor"] in {"thread", "process"}
+    assert scheduler["timeline_events"] >= len(modality_events)
 
     manifest_response = client.get(f"/manifests/{token_id}")
     assert manifest_response.status_code == 200

@@ -31,6 +31,7 @@ from web_stable_diffusion.models.miniturbo_omnimodal import (
     OmniModalMiniturbo,
     ResourceBudget,
 )
+from web_stable_diffusion.runtime.benchmarking import summarise_benchmark
 
 
 logger = logging.getLogger(__name__)
@@ -643,6 +644,11 @@ def _stream_bundle_events(
         return
     else:
         engine_manager.mark_healthy()
+        elapsed = time.perf_counter() - start
+        metrics: Dict[str, Any] = {
+            "wall_clock_s_total": total_wall,
+            "wall_clock_s_elapsed": elapsed,
+        }
         manifest = {
             "artifacts": artifacts,
             "metadata": {
@@ -655,16 +661,14 @@ def _stream_bundle_events(
                     }
                     for key, budget in (budgets or {}).items()
                 },
-                "metrics": {
-                    "wall_clock_s_total": total_wall,
-                    "wall_clock_s_elapsed": time.perf_counter() - start,
-                },
+                "metrics": metrics,
             },
         }
 
         benchmark = getattr(engine, "last_benchmark", None)
         if benchmark:
-            manifest["metadata"]["metrics"]["scalability"] = _normalise_metadata(benchmark)
+            metrics["scheduler"] = summarise_benchmark(benchmark)
+            metrics["scalability"] = _normalise_metadata(benchmark)
 
         manifest_registry.record_complete(token_id, manifest)
         yield json.dumps({"type": "complete", "manifest": manifest}) + "\n"

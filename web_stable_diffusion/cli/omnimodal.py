@@ -19,6 +19,7 @@ from web_stable_diffusion.models.miniturbo_omnimodal import (
     OmniModalMiniturbo,
     ResourceBudget,
 )
+from web_stable_diffusion.runtime.benchmarking import summarise_benchmark
 
 
 def _serialise_payload(array: np.ndarray, output_path: pathlib.Path) -> str:
@@ -100,6 +101,7 @@ def _bundle_to_manifest(
     if benchmark is not None:
         manifest["metadata"]["benchmark"] = benchmark
     total_duration = 0.0
+    metrics_summary: Dict[str, Any] = {}
     for key, result in bundle.items():
         array = result.to_numpy()
         artifact_path = base_dir / f"{key}.npz"
@@ -112,12 +114,18 @@ def _bundle_to_manifest(
             "device": result.device,
             "metadata": result.metadata,
         }
-        metrics = result.metadata.get("metrics") if isinstance(result.metadata, dict) else None
-        if metrics and "wall_clock_s" in metrics:
-            total_duration += float(metrics["wall_clock_s"])
+        modality_metrics = result.metadata.get("metrics") if isinstance(result.metadata, dict) else None
+        if modality_metrics and "wall_clock_s" in modality_metrics:
+            total_duration += float(modality_metrics["wall_clock_s"])
         manifest["artifacts"][key] = entry
-    if total_duration:
-        manifest["metadata"]["metrics"] = {"wall_clock_s_total": total_duration}
+    if total_duration or bundle:
+        metrics_summary["wall_clock_s_total"] = float(total_duration)
+    if benchmark is not None:
+        scheduler = summarise_benchmark(benchmark)
+        if scheduler:
+            metrics_summary["scheduler"] = scheduler
+    if metrics_summary:
+        manifest["metadata"]["metrics"] = metrics_summary
     return manifest
 
 
