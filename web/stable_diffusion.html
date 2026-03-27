@@ -42,7 +42,7 @@
   </head>
   <body>
     <h1>Sana 0.6B</h1>
-    <p class="subtitle">1024–4K image generation — runs entirely in your browser via WebGPU</p>
+    <p class="subtitle">1024–4K image generation in your browser via WebGPU. Requires 4+ GB GPU.</p>
 
     <div class="container">
       <div id="gpu-status">Detecting GPU...</div>
@@ -83,7 +83,7 @@
         </div>
         <div class="input-group" style="max-width: 200px;">
           <label>Text Encoder</label>
-          <div style="padding: 0.75rem; font-size: 0.8rem; color: #888;">CLIP ViT-L (856 MB)</div>
+          <div style="padding: 0.75rem; font-size: 0.8rem; color: #888;">CLIP ViT-L (432 MB)</div>
         </div>
       </div>
 
@@ -98,14 +98,24 @@
 
     <script>
       // ===== Resolution selector =====
-      const VRAM_MAP = { "1024": "~3 GB VRAM", "2048": "~6 GB VRAM", "4096": "~16 GB VRAM" };
+      // DiT is float32 (~2.3 GB) + VAE (~608 MB) + CLIP (~432 MB) + inference buffers
+      const VRAM_REQS = { "1024": 4, "2048": 8, "4096": 18 };
+      const VRAM_MAP = { "1024": "~4 GB VRAM needed", "2048": "~8 GB VRAM needed", "4096": "~18 GB VRAM needed" };
       const resSelect = document.getElementById("resolution");
       const vramNote = document.getElementById("vram-note");
       const canvas = document.getElementById("canvas");
+      let detectedVRAM = 0;
 
       resSelect.addEventListener("change", function() {
         const res = parseInt(this.value);
-        vramNote.textContent = VRAM_MAP[this.value] || "";
+        const needed = VRAM_REQS[this.value] || 4;
+        if (detectedVRAM > 0 && detectedVRAM < needed) {
+          vramNote.textContent = "⚠ " + VRAM_MAP[this.value] + " (your GPU: " + detectedVRAM.toFixed(1) + " GB)";
+          vramNote.style.color = "#e55";
+        } else {
+          vramNote.textContent = VRAM_MAP[this.value];
+          vramNote.style.color = "#555";
+        }
         canvas.width = res;
         canvas.height = res;
       });
@@ -115,34 +125,43 @@
         const gpuStatusEl = document.getElementById("gpu-status");
         if (!navigator.gpu) {
           gpuStatusEl.textContent = "WebGPU not supported in this browser.";
+          gpuStatusEl.style.color = "#e55";
           return null;
         }
         try {
           const adapter = await navigator.gpu.requestAdapter();
           if (!adapter) {
             gpuStatusEl.textContent = "No WebGPU adapter found.";
+            gpuStatusEl.style.color = "#e55";
             return null;
           }
           const info = adapter.info || (adapter.requestAdapterInfo ? await adapter.requestAdapterInfo() : {});
           const desc = info.description || info.vendor || "Unknown GPU";
           const maxBuffer = adapter.limits.maxBufferSize;
-          const estimatedVRAM = maxBuffer / (1024 * 1024 * 1024); // rough GB estimate
+          detectedVRAM = maxBuffer / (1024 * 1024 * 1024);
 
-          gpuStatusEl.textContent = "GPU: " + desc + " (~" + estimatedVRAM.toFixed(1) + " GB buffer limit)";
+          gpuStatusEl.textContent = "GPU: " + desc + " (~" + detectedVRAM.toFixed(1) + " GB buffer limit)";
 
-          // Auto-select best resolution based on estimated VRAM
-          if (estimatedVRAM >= 16) {
+          // Check minimum VRAM (DiT model is ~2.3 GB float32)
+          if (detectedVRAM < 3) {
+            gpuStatusEl.textContent += " — ⚠ Low VRAM. Sana requires 4+ GB GPU. Consider using server-side generation.";
+            gpuStatusEl.style.color = "#e95";
+          }
+
+          // Auto-select best resolution based on VRAM
+          if (detectedVRAM >= 18) {
             resSelect.value = "4096";
-          } else if (estimatedVRAM >= 6) {
+          } else if (detectedVRAM >= 8) {
             resSelect.value = "2048";
           } else {
             resSelect.value = "1024";
           }
           resSelect.dispatchEvent(new Event("change"));
 
-          return { adapter, info, estimatedVRAM };
+          return { adapter, info, estimatedVRAM: detectedVRAM };
         } catch (e) {
           gpuStatusEl.textContent = "GPU detection failed: " + e.message;
+          gpuStatusEl.style.color = "#e55";
           return null;
         }
       }
