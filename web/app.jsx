@@ -400,7 +400,7 @@ function resolveOmniModalApiConfig() {
     return null;
   }
   return {
-    baseUrl: baseUrl.replace(/\/+$, ""),
+    baseUrl: baseUrl.replace(/\/+$/, ""),
     headers,
   };
 }
