@@ -78,6 +78,7 @@
     <script type="module">
       // Import web-txt2img direct API (no worker needed)
       import { loadModel, generateImage, isModelLoaded } from './node_modules/web-txt2img/dist/index.js';
+      import * as ort from './node_modules/onnxruntime-web/dist/ort.all.mjs';
 
       const statusEl = document.getElementById("status");
       const progressEl = document.getElementById("progress");
@@ -140,6 +141,7 @@
         generateBtn.textContent = "Loading model...";
 
         const loadResult = await loadModel("sd-turbo", {
+          ort: ort,
           backendPreference: ["webgpu"],
           progressCallback: (info) => {
             console.log("Load progress:", info);
