@@ -561,6 +561,13 @@ def _error_response(exc: Exception) -> Dict[str, Any]:
     return payload
 
 
+class Img2ImgRequest(BaseModel):
+    prompt: str = Field(..., min_length=1)
+    image_base64: str = Field(..., min_length=1)
+    strength: float = Field(0.75, ge=0.0, le=1.0)
+    negative_prompt: Optional[str] = None
+
+
 class GenerateRequest(BaseModel):
     prompt: str = Field(..., min_length=1)
     resolution: int = Field(512, ge=16, le=1024)
@@ -705,6 +712,35 @@ def create_app() -> FastAPI:
         budgets = request.budget_overrides()
         stream = _stream_bundle_events(request, token_id, token, budgets or None)
         return StreamingResponse(stream, media_type="application/jsonl")
+
+    @app.post("/img2img", dependencies=_secured_dependencies())
+    async def img2img(request: Img2ImgRequest) -> Dict[str, Any]:
+        from web_stable_diffusion.models.backends.diffusers_image import DiffusersImageBackend
+
+        backend = DiffusersImageBackend.from_environment() or DiffusersImageBackend.from_default()
+        if backend is None:
+            raise HTTPException(status_code=503, detail="Diffusers backend unavailable")
+
+        try:
+            raw_bytes = base64.b64decode(request.image_base64)
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail=f"Invalid base64 image: {exc}") from exc
+
+        input_image = np.asarray(Image.open(io.BytesIO(raw_bytes)).convert("RGB"))
+
+        result = backend.img2img(
+            prompt=request.prompt,
+            input_image=input_image,
+            strength=request.strength,
+            negative_prompt=request.negative_prompt,
+        )
+
+        output_b64, mime = _encode_image_payload(result["array"])
+        return {
+            "image_base64": output_b64,
+            "mime_type": mime,
+            "metadata": _normalise_metadata(result["metadata"]),
+        }
 
     @app.post("/cancel/{token_id}", dependencies=_secured_dependencies())
     def cancel_generation(token_id: str) -> Dict[str, Any]:

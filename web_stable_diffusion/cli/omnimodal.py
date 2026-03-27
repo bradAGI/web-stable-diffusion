@@ -73,6 +73,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Optional JSON file defining per-modality resource budgets",
     )
     parser.add_argument(
+        "--negative-prompt",
+        default=None,
+        help="Negative prompt to steer the generation away from unwanted content",
+    )
+    parser.add_argument(
         "--log-level",
         default="WARNING",
         choices=["CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"],
@@ -228,6 +233,7 @@ def main(argv: list[str] | None = None) -> int:
             timeout=args.timeout,
             budgets=budgets,
             cancellation=token,
+            negative_prompt=args.negative_prompt,
         )
     except GenerationCancelled as exc:
         logger.warning("Generation cancelled: %s", exc.reason)

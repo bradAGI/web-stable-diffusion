@@ -747,6 +747,7 @@ class OmniModalMiniturbo:
         timeout: Optional[float] = None,
         budgets: Optional[Mapping[str, ResourceBudget]] = None,
         cancellation: Optional[CancellationToken] = None,
+        negative_prompt: Optional[str] = None,
     ) -> Iterator[BundleEvent]:
         """Yield :class:`BundleEvent` instances as modalities finish.
 
@@ -768,7 +769,7 @@ class OmniModalMiniturbo:
 
         tasks = {
             "audio": (self.generate_audio, {"prompt": prompt, "length": audio_length}),
-            "image": (self.generate_image, {"prompt": prompt, "resolution": resolution}),
+            "image": (self.generate_image, {"prompt": prompt, "resolution": resolution, "negative_prompt": negative_prompt}),
             "volume": (self.generate_volume, {"prompt": prompt, "size": volume_size}),
             "video": (
                 self.generate_video,
@@ -1035,6 +1036,7 @@ class OmniModalMiniturbo:
         timeout: Optional[float] = None,
         budgets: Optional[Mapping[str, ResourceBudget]] = None,
         cancellation: Optional[CancellationToken] = None,
+        negative_prompt: Optional[str] = None,
     ) -> Dict[str, DeviceAwareResult]:
         """Generate all modalities in parallel and return a device-aware bundle.
 
@@ -1076,6 +1078,7 @@ class OmniModalMiniturbo:
             timeout=timeout,
             budgets=budgets,
             cancellation=cancellation,
+            negative_prompt=negative_prompt,
         ):
             results[event.key] = event.result
         return results
