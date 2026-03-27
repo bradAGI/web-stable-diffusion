@@ -316,44 +316,18 @@ def compile_sana_to_wasm():
                 print(f"  ✗ Transformer trace failed for {res_name}: {e2}")
                 # Save ONNX as fallback
                 try:
-                    fp32_onnx_path = f"{variant_dir}/sana_dit_{res_name}_fp32.onnx"
                     onnx_path = f"{variant_dir}/sana_dit_{res_name}.onnx"
                     torch.onnx.export(
-                        dit_wrapper, (dummy_hidden, dummy_encoder_hidden, dummy_timestep), fp32_onnx_path,
+                        dit_wrapper, (dummy_hidden, dummy_encoder_hidden, dummy_timestep), onnx_path,
                         input_names=["hidden_states", "encoder_hidden_states", "timestep"],
                         output_names=["output"],
                         dynamic_axes=None, opset_version=18,
                     )
-                    print(f"  ✓ Transformer exported as float32 ONNX")
-
-                    # Convert to mixed-precision fp16 (keeps LayerNorm/Softmax in fp32)
-                    try:
-                        from onnxruntime.transformers.float16 import convert_float_to_float16
-                        import onnx
-                        print(f"  Converting to mixed-precision fp16...")
-                        model = onnx.load(fp32_onnx_path)
-                        model_fp16 = convert_float_to_float16(
-                            model,
-                            keep_io_types=False,
-                            op_block_list=["LayerNormalization", "Softmax", "ReduceMean"],
-                        )
-                        onnx.save(model_fp16, onnx_path)
-                        # Clean up fp32 version
-                        for f in [fp32_onnx_path, fp32_onnx_path + ".data"]:
-                            if os.path.exists(f):
-                                os.remove(f)
-                        onnx_size = os.path.getsize(onnx_path) / 1e6
-                        data_file = onnx_path + ".data"
-                        if os.path.exists(data_file):
-                            onnx_size += os.path.getsize(data_file) / 1e6
-                        print(f"  ✓ Mixed-precision fp16 DiT: {onnx_size:.0f} MB")
-                    except Exception as conv_err:
-                        print(f"  ⚠ fp16 conversion failed ({conv_err}), keeping fp32")
-                        import shutil
-                        shutil.move(fp32_onnx_path, onnx_path)
-                        for f in [fp32_onnx_path + ".data"]:
-                            if os.path.exists(f):
-                                shutil.move(f, onnx_path + ".data")
+                    onnx_size = os.path.getsize(onnx_path) / 1e6
+                    data_file = onnx_path + ".data"
+                    if os.path.exists(data_file):
+                        onnx_size += os.path.getsize(data_file) / 1e6
+                    print(f"  ✓ Transformer exported as float32 ONNX: {onnx_size:.0f} MB")
                 except Exception as e3:
                     print(f"  ✗ ONNX export also failed: {e3}")
 
@@ -719,10 +693,73 @@ def export_text_encoder_quantized():
     print(f"\n✓ Quantized text encoder saved to volume")
 
 
+@app.function(
+    image=compiler_image,
+    gpu="A100",
+    timeout=3600,
+    volumes={OUTPUT_DIR: vol},
+    memory=32768,
+)
+def export_dit_float32_only():
+    """Re-export only the DiT in float32 (fix NaN issue). Skip VAE/text encoder."""
+    import os
+    import torch
+
+    print("=" * 60)
+    print("Re-exporting DiT ONLY in float32")
+    print("=" * 60)
+
+    from diffusers import SanaPipeline as SanaPipe
+    pipe = SanaPipe.from_pretrained(SANA_MODEL_ID, torch_dtype=torch.float16, variant="fp16")
+    pipe = pipe.to("cuda")
+
+    transformer = pipe.transformer
+    transformer.eval()
+    latent_channels = transformer.config.in_channels
+    text_hidden_size = transformer.config.caption_channels
+
+    class TransformerWrapper(torch.nn.Module):
+        def __init__(self, dit_model):
+            super().__init__()
+            self.dit = dit_model
+        def forward(self, hidden_states, encoder_hidden_states, timestep):
+            return self.dit(hidden_states, encoder_hidden_states=encoder_hidden_states, timestep=timestep, return_dict=False)[0]
+
+    dit_wrapper = TransformerWrapper(transformer).cuda().float().eval()
+
+    for variant in RESOLUTION_VARIANTS:
+        res_name = variant["name"]
+        latent_h = latent_w = variant["latent_size"]
+        variant_dir = f"{OUTPUT_DIR}/sana-wasm/{res_name}"
+        os.makedirs(variant_dir, exist_ok=True)
+
+        print(f"  Exporting DiT for {res_name}x{res_name}...")
+        dummy_h = torch.randn(1, latent_channels, latent_h, latent_w, dtype=torch.float32, device="cuda")
+        dummy_e = torch.randn(1, 300, text_hidden_size, dtype=torch.float32, device="cuda")
+        dummy_t = torch.tensor([500.0], dtype=torch.float32, device="cuda")
+
+        onnx_path = f"{variant_dir}/sana_dit_{res_name}.onnx"
+        with torch.no_grad():
+            torch.onnx.export(
+                dit_wrapper, (dummy_h, dummy_e, dummy_t), onnx_path,
+                input_names=["hidden_states", "encoder_hidden_states", "timestep"],
+                output_names=["output"],
+                dynamic_axes=None, opset_version=18,
+            )
+        size = os.path.getsize(onnx_path) / 1e6
+        data_file = onnx_path + ".data"
+        if os.path.exists(data_file):
+            size += os.path.getsize(data_file) / 1e6
+        print(f"  ✓ DiT {res_name}: {size:.0f} MB")
+        torch.cuda.empty_cache()
+
+    vol.commit()
+    print("\n✓ All DiT models re-exported in float32")
+
+
 @app.local_entrypoint()
 def main():
-    # Re-export DiT in float32 to fix NaN issue
-    print("Re-exporting all models (DiT in float32)...")
-    compile_sana_to_wasm.remote()
+    print("Re-exporting DiT in float32 (fix NaN)...")
+    export_dit_float32_only.remote()
     print("\nDone! Download with:")
     print("  modal volume get sana-wasm-artifacts /artifacts/sana-wasm ./sana-wasm")
