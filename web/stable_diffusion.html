@@ -137,7 +137,7 @@
         return "0"; // DPM Solver
       };
       tvmjsGlobalEnv.getVaeCycle = function() {
-        return -1;
+        return 5; // render preview every 5 UNet steps
       };
       tvmjsGlobalEnv.onGenerationLifecycle = function(stage) {
         if (stage === "start") {

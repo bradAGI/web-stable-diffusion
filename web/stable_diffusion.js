@@ -851,7 +851,7 @@ class StableDiffusionPipeline {
     progressCallback = undefined,
     schedulerId = 0,
     vaeCycle = -1,
-    beginRenderVae = 10
+    beginRenderVae = 0
   ) {
     // Principle: beginScope/endScope in synchronized blocks,
     // this helps to recycle intermediate memories
@@ -1101,7 +1101,7 @@ class DiffusionXLPipeline {
     progressCallback = undefined,
     schedulerId = 0,
     vaeCycle = -1,
-    beginRenderVae = 10
+    beginRenderVae = 0
   ) {
     this.tvm.beginScope();
     // get latents
