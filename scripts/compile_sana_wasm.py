@@ -126,7 +126,11 @@ def compile_sana_to_wasm():
     transformer.eval()
     latent_channels = pipe.transformer.config.in_channels
 
-    target = tvm.target.Target("webgpu", host="llvm -mtriple=wasm32-unknown-unknown-wasm")
+    # New TVM requires JSON dict format for targets
+    target = tvm.target.Target(
+        {"kind": "webgpu"},
+        host={"kind": "llvm", "mtriple": "wasm32-unknown-unknown-wasm"},
+    )
 
     # Activate emscripten once
     os.environ["EMSDK"] = "/opt/emsdk"
