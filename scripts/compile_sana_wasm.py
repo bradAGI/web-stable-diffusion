@@ -142,11 +142,11 @@ def compile_sana_to_wasm():
     class VAEDecodeWrapper(torch.nn.Module):
         def __init__(self, vae_model):
             super().__init__()
-            self.vae = vae_model
+            # Convert entire VAE to float32 to avoid mixed-precision tracing issues
+            self.vae = vae_model.float()
 
         def forward(self, latent):
-            # DC-AE may have mixed precision — use float32 for tracing
-            return self.vae.decode(latent.float()).sample.half()
+            return self.vae.decode(latent).sample
 
     # Wrap transformer for tracing (disable control flow)
     class TransformerWrapper(torch.nn.Module):
@@ -162,7 +162,7 @@ def compile_sana_to_wasm():
                 return_dict=False,
             )[0]
 
-    vae_wrapper = VAEDecodeWrapper(vae).cuda().half().eval()
+    vae_wrapper = VAEDecodeWrapper(vae).cuda().eval()  # float32 for VAE
     dit_wrapper = TransformerWrapper(transformer).cuda().half().eval()
 
     # Get the correct text encoder hidden size from model config
@@ -184,7 +184,7 @@ def compile_sana_to_wasm():
 
         # --- Trace DC-AE decoder ---
         print(f"  Tracing DC-AE decoder for {res_name}...")
-        dummy_latent = torch.randn(1, latent_channels, latent_h, latent_w, dtype=torch.float16, device="cuda")
+        dummy_latent = torch.randn(1, latent_channels, latent_h, latent_w, dtype=torch.float32, device="cuda")
         vae_mod = None
         try:
             # Use torch.jit.trace which handles control flow better
@@ -213,7 +213,7 @@ def compile_sana_to_wasm():
                     torch.onnx.export(
                         vae_wrapper, (dummy_latent,), onnx_path,
                         input_names=["latent"], output_names=["image"],
-                        dynamic_axes=None, opset_version=17,
+                        dynamic_axes=None, opset_version=18,
                     )
                     print(f"  ✓ VAE exported to ONNX: {onnx_path}")
                 except Exception as e3:
@@ -257,7 +257,7 @@ def compile_sana_to_wasm():
                         dit_wrapper, (dummy_hidden, dummy_encoder_hidden, dummy_timestep), onnx_path,
                         input_names=["hidden_states", "encoder_hidden_states", "timestep"],
                         output_names=["output"],
-                        dynamic_axes=None, opset_version=17,
+                        dynamic_axes=None, opset_version=18,
                     )
                     print(f"  ✓ Transformer exported to ONNX: {onnx_path}")
                 except Exception as e3:
