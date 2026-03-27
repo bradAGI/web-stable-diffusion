@@ -43,8 +43,10 @@ compiler_image = (
         "Pillow",
     )
     .run_commands(
-        # Install MLC AI / TVM Unity — CUDA 12.4 wheel for A100
-        "pip install mlc-ai-nightly-cu124 -f https://mlc.ai/wheels",
+        # Install MLC AI / TVM Unity — try cu124 wheel, then cpu fallback
+        "pip install --verbose mlc-ai-nightly-cu124 -f https://mlc.ai/wheels || pip install mlc-ai-nightly-cpu -f https://mlc.ai/wheels",
+        # Debug: show what was installed
+        "pip list | grep -i mlc && pip list | grep -i tvm && python -c 'import tvm; print(tvm.__version__)' || echo 'TVM import failed, checking alternatives...' && python -c 'import sys; [print(p) for p in sys.path]'",
         # Install Emscripten
         "git clone https://github.com/emscripten-core/emsdk.git /opt/emsdk",
         "cd /opt/emsdk && ./emsdk install latest && ./emsdk activate latest",
