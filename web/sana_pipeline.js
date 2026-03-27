@@ -82,21 +82,29 @@ class SanaPipeline {
       step++;
     }
 
-    // 3. Load DiT
+    // 3. Load DiT (has external .data file for weights)
     if (onProgress) onProgress(`Loading Sana DiT for ${variant}×${variant} (1.2 GB)...`, step, totalSteps);
     const ditUrl = `${MODEL_BASE_URL}/${this.config.ditFile}`;
-    console.log("Loading DiT from:", ditUrl);
+    const ditDataUrl = `${MODEL_BASE_URL}/${this.config.ditFile}.data`;
+    console.log("Loading DiT from:", ditUrl, "+ data:", ditDataUrl);
     if (this.ditSession) await this.ditSession.release();
-    this.ditSession = await this.ort.InferenceSession.create(ditUrl, sessionOpts);
+    this.ditSession = await this.ort.InferenceSession.create(ditUrl, {
+      ...sessionOpts,
+      externalData: [{ path: this.config.ditFile.split("/").pop() + ".data", data: ditDataUrl }],
+    });
     console.log("DiT inputs:", this.ditSession.inputNames, "outputs:", this.ditSession.outputNames);
     step++;
 
-    // 4. Load VAE
+    // 4. Load VAE (has external .data file for weights)
     if (onProgress) onProgress("Loading VAE decoder (608 MB)...", step, totalSteps);
     const vaeUrl = `${MODEL_BASE_URL}/${this.config.vaeFile}`;
-    console.log("Loading VAE from:", vaeUrl);
+    const vaeDataUrl = `${MODEL_BASE_URL}/${this.config.vaeFile}.data`;
+    console.log("Loading VAE from:", vaeUrl, "+ data:", vaeDataUrl);
     if (this.vaeSession) await this.vaeSession.release();
-    this.vaeSession = await this.ort.InferenceSession.create(vaeUrl, sessionOpts);
+    this.vaeSession = await this.ort.InferenceSession.create(vaeUrl, {
+      ...sessionOpts,
+      externalData: [{ path: this.config.vaeFile.split("/").pop() + ".data", data: vaeDataUrl }],
+    });
     console.log("VAE inputs:", this.vaeSession.inputNames, "outputs:", this.vaeSession.outputNames);
     step++;
 
