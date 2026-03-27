@@ -3,46 +3,37 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Sana — Browser Image Generation</title>
+    <title>Image Gen — Browser AI</title>
     <style>
       * { box-sizing: border-box; margin: 0; padding: 0; }
       body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0a0a0a; color: #e0e0e0; min-height: 100vh; display: flex; flex-direction: column; align-items: center; }
       h1 { font-size: 1.5rem; margin: 2rem 0 0.25rem; }
       .subtitle { color: #888; font-size: 0.85rem; margin-bottom: 1.5rem; }
-      .container { width: 100%; max-width: 700px; padding: 0 1rem; }
+      .container { width: 100%; max-width: 640px; padding: 0 1rem; }
       .input-group { display: flex; flex-direction: column; gap: 0.5rem; margin-bottom: 1rem; }
       .row { display: flex; gap: 1rem; }
       .row .input-group { flex: 1; }
       label { font-size: 0.8rem; color: #aaa; }
-      textarea, input[type="text"], select {
-        background: #1a1a1a; border: 1px solid #333; border-radius: 8px;
-        padding: 0.75rem; color: #fff; font-size: 0.9rem; resize: none; outline: none;
-      }
-      select { cursor: pointer; }
-      textarea:focus, input:focus, select:focus { border-color: #666; }
-      .actions { display: flex; gap: 0.75rem; align-items: center; margin-bottom: 1rem; }
-      button {
-        background: #fff; color: #000; border: none; border-radius: 8px;
-        padding: 0.75rem 1.5rem; font-size: 0.9rem; font-weight: 600;
-        cursor: pointer; transition: opacity 0.2s;
-      }
+      textarea, select { background: #1a1a1a; border: 1px solid #333; border-radius: 8px; padding: 0.75rem; color: #fff; font-size: 0.9rem; resize: none; outline: none; }
+      textarea:focus, select:focus { border-color: #666; }
+      button { background: #fff; color: #000; border: none; border-radius: 8px; padding: 0.75rem 1.5rem; font-size: 0.9rem; font-weight: 600; cursor: pointer; transition: opacity 0.2s; }
       button:hover { opacity: 0.85; }
       button:disabled { opacity: 0.4; cursor: not-allowed; }
       .canvas-wrap { margin: 1rem 0 2rem; display: flex; justify-content: center; }
-      canvas { border-radius: 8px; border: 1px solid #222; background: #111; max-width: 100%; height: auto; }
+      canvas, img { border-radius: 8px; border: 1px solid #222; background: #111; max-width: 100%; }
       #status { font-size: 0.8rem; color: #888; margin-bottom: 0.5rem; min-height: 1.2em; }
       .progress-wrap { width: 100%; margin-bottom: 1rem; }
       progress { width: 100%; height: 6px; appearance: none; border: none; border-radius: 3px; overflow: hidden; }
       progress::-webkit-progress-bar { background: #222; border-radius: 3px; }
       progress::-webkit-progress-value { background: #fff; border-radius: 3px; }
       #gpu-status { font-size: 0.75rem; color: #666; margin-bottom: 1rem; }
-      .res-badge { font-size: 0.7rem; color: #666; margin-left: 0.25rem; }
-      .vram-note { font-size: 0.7rem; color: #555; margin-top: 0.25rem; }
+      .model-info { font-size: 0.7rem; color: #555; margin-top: 0.25rem; }
+      #output-img { display: none; width: 512px; height: 512px; }
     </style>
   </head>
   <body>
-    <h1>Sana 0.6B</h1>
-    <p class="subtitle">1024–4K image generation in your browser via WebGPU. Requires 4+ GB GPU.</p>
+    <h1>Browser Image Generation</h1>
+    <p class="subtitle">Runs entirely in your browser via WebGPU. No server needed.</p>
 
     <div class="container">
       <div id="gpu-status">Detecting GPU...</div>
@@ -57,202 +48,151 @@
       </div>
 
       <div class="row">
-        <div class="input-group">
-          <label for="neg-prompt">Negative prompt</label>
-          <input type="text" id="neg-prompt" placeholder="blurry, low quality" value="" />
-        </div>
-        <div class="input-group" style="max-width: 160px;">
-          <label for="resolution">Resolution</label>
-          <select id="resolution">
-            <option value="1024" selected>1024 × 1024</option>
-            <option value="2048">2048 × 2048</option>
-            <option value="4096">4096 × 4096</option>
+        <div class="input-group" style="max-width: 180px;">
+          <label for="model">Model</label>
+          <select id="model">
+            <option value="sd-turbo" selected>SD-Turbo (fast, 250 MB)</option>
           </select>
-          <div class="vram-note" id="vram-note">~3 GB VRAM</div>
+          <div class="model-info">512×512 · 1 step · ~2-5s</div>
         </div>
-      </div>
-
-      <div class="row">
         <div class="input-group" style="max-width: 120px;">
-          <label for="steps">Steps</label>
-          <select id="steps">
-            <option value="10">10</option>
-            <option value="20" selected>20</option>
-            <option value="30">30</option>
+          <label for="seed">Seed</label>
+          <select id="seed">
+            <option value="random" selected>Random</option>
+            <option value="42">42</option>
+            <option value="123">123</option>
+            <option value="7777">7777</option>
           </select>
-        </div>
-        <div class="input-group" style="max-width: 200px;">
-          <label>Text Encoder</label>
-          <div style="padding: 0.75rem; font-size: 0.8rem; color: #888;">CLIP ViT-L (432 MB)</div>
         </div>
       </div>
 
-      <div class="actions">
+      <div style="margin-bottom: 1rem;">
         <button id="generate-btn" disabled>Detecting GPU...</button>
       </div>
 
       <div class="canvas-wrap">
-        <canvas id="canvas" width="1024" height="1024"></canvas>
+        <img id="output-img" alt="Generated image" />
       </div>
     </div>
 
-    <script>
-      // ===== Resolution selector =====
-      // DiT is float32 (~2.3 GB) + VAE (~608 MB) + CLIP (~432 MB) + inference buffers
-      const VRAM_REQS = { "1024": 4, "2048": 8, "4096": 18 };
-      const VRAM_MAP = { "1024": "~4 GB VRAM needed", "2048": "~8 GB VRAM needed", "4096": "~18 GB VRAM needed" };
-      const resSelect = document.getElementById("resolution");
-      const vramNote = document.getElementById("vram-note");
-      const canvas = document.getElementById("canvas");
-      let detectedVRAM = 0;
+    <script type="module">
+      // Import web-txt2img from CDN
+      import { Txt2ImgWorkerClient } from 'https://esm.sh/web-txt2img@0.3.1';
 
-      resSelect.addEventListener("change", function() {
-        const res = parseInt(this.value);
-        const needed = VRAM_REQS[this.value] || 4;
-        if (detectedVRAM > 0 && detectedVRAM < needed) {
-          vramNote.textContent = "⚠ " + VRAM_MAP[this.value] + " (your GPU: " + detectedVRAM.toFixed(1) + " GB)";
-          vramNote.style.color = "#e55";
-        } else {
-          vramNote.textContent = VRAM_MAP[this.value];
-          vramNote.style.color = "#555";
-        }
-        canvas.width = res;
-        canvas.height = res;
-      });
+      const statusEl = document.getElementById("status");
+      const progressEl = document.getElementById("progress");
+      const gpuStatusEl = document.getElementById("gpu-status");
+      const generateBtn = document.getElementById("generate-btn");
+      const promptEl = document.getElementById("prompt");
+      const modelSelect = document.getElementById("model");
+      const seedSelect = document.getElementById("seed");
+      const outputImg = document.getElementById("output-img");
 
-      // ===== GPU detection + auto-select best resolution =====
+      function setStatus(msg) { statusEl.textContent = msg; }
+      function setProgress(val) { progressEl.value = val; }
+
+      let client = null;
+      let modelLoaded = false;
+
+      // Detect GPU
       async function detectGPU() {
-        const gpuStatusEl = document.getElementById("gpu-status");
         if (!navigator.gpu) {
-          gpuStatusEl.textContent = "WebGPU not supported in this browser.";
+          gpuStatusEl.textContent = "WebGPU not supported. Try Chrome or Edge.";
           gpuStatusEl.style.color = "#e55";
-          return null;
+          return false;
         }
         try {
           const adapter = await navigator.gpu.requestAdapter();
           if (!adapter) {
             gpuStatusEl.textContent = "No WebGPU adapter found.";
             gpuStatusEl.style.color = "#e55";
-            return null;
+            return false;
           }
-          const info = adapter.info || (adapter.requestAdapterInfo ? await adapter.requestAdapterInfo() : {});
+          const info = adapter.info || {};
           const desc = info.description || info.vendor || "Unknown GPU";
-          const maxBuffer = adapter.limits.maxBufferSize;
-          detectedVRAM = maxBuffer / (1024 * 1024 * 1024);
-
-          gpuStatusEl.textContent = "GPU: " + desc + " (~" + detectedVRAM.toFixed(1) + " GB buffer limit)";
-
-          // Check minimum VRAM (DiT model is ~2.3 GB float32)
-          if (detectedVRAM < 3) {
-            gpuStatusEl.textContent += " — ⚠ Low VRAM. Sana requires 4+ GB GPU. Consider using server-side generation.";
-            gpuStatusEl.style.color = "#e95";
-          }
-
-          // Auto-select best resolution based on VRAM
-          if (detectedVRAM >= 18) {
-            resSelect.value = "4096";
-          } else if (detectedVRAM >= 8) {
-            resSelect.value = "2048";
-          } else {
-            resSelect.value = "1024";
-          }
-          resSelect.dispatchEvent(new Event("change"));
-
-          return { adapter, info, estimatedVRAM: detectedVRAM };
+          const vram = (adapter.limits.maxBufferSize / (1024**3)).toFixed(1);
+          gpuStatusEl.textContent = "GPU: " + desc + " (~" + vram + " GB)";
+          return true;
         } catch (e) {
           gpuStatusEl.textContent = "GPU detection failed: " + e.message;
-          gpuStatusEl.style.color = "#e55";
-          return null;
+          return false;
         }
       }
 
-      // ===== Status helpers =====
-      const statusEl = document.getElementById("status");
-      const progressEl = document.getElementById("progress");
-      const generateBtn = document.getElementById("generate-btn");
-
-      function setStatus(msg) { statusEl.textContent = msg; }
-      function setProgress(val) { progressEl.value = val; }
-
-      // ===== Sana ONNX Pipeline =====
-      let sanaPipeline = null;
-      let currentVariant = null;
-
+      // Initialize
       async function init() {
-        const gpu = await detectGPU();
-        if (!gpu) {
-          setStatus("WebGPU not available. Cannot generate images locally.");
+        const hasGPU = await detectGPU();
+        if (!hasGPU) {
+          setStatus("WebGPU required for browser image generation.");
           return;
         }
 
-        setStatus("Ready! Select resolution and enter a prompt.");
+        setStatus("Ready! Enter a prompt and click Generate.");
         generateBtn.textContent = "Generate";
         generateBtn.disabled = false;
       }
 
-      async function ensurePipeline(variant) {
-        if (currentVariant === variant && sanaPipeline) return;
+      async function ensureModel() {
+        if (client && modelLoaded) return;
 
-        // Dispose old pipeline if switching resolution
-        if (sanaPipeline) {
-          await sanaPipeline.dispose();
-        }
-
-        sanaPipeline = new SanaPipeline();
-        setStatus("Loading Sana " + variant + "×" + variant + " model...");
+        setStatus("Loading SD-Turbo model (250 MB, cached after first use)...");
+        setProgress(10);
         generateBtn.disabled = true;
         generateBtn.textContent = "Loading model...";
 
-        await sanaPipeline.init(variant, {
-          onProgress: function(msg, step, total) {
-            setStatus(msg);
-            setProgress((step / total) * 100);
-          }
+        client = Txt2ImgWorkerClient.createDefault();
+
+        await client.load("sd-turbo", {
+          backendPreference: ["webgpu"],
+          progressCallback: (info) => {
+            if (info.phase) setStatus("Loading: " + info.phase);
+            if (info.progress != null) setProgress(info.progress * 100);
+          },
         });
 
-        currentVariant = variant;
+        modelLoaded = true;
+        setStatus("Model loaded! Generating...");
+        setProgress(50);
       }
 
-      generateBtn.addEventListener("click", async function() {
-        const res = resSelect.value;
-        const steps = parseInt(document.getElementById("steps").value);
-        const prompt = document.getElementById("prompt").value.trim();
-        const negPrompt = document.getElementById("neg-prompt").value.trim();
+      generateBtn.addEventListener("click", async () => {
+        const prompt = promptEl.value.trim();
         if (!prompt) { setStatus("Please enter a prompt."); return; }
 
         generateBtn.disabled = true;
-        generateBtn.textContent = "Generating " + res + "×" + res + "...";
+        generateBtn.textContent = "Generating...";
         setProgress(0);
-
-        // Update canvas size
-        const resolution = parseInt(res);
-        canvas.width = resolution;
-        canvas.height = resolution;
+        outputImg.style.display = "none";
 
         try {
-          // Load pipeline if needed
-          await ensurePipeline(res);
+          await ensureModel();
 
-          // Generate
-          console.log("Pipeline loaded, starting generation...");
-          const imageData = await sanaPipeline.generate(prompt, {
-            steps: steps,
-            onProgress: function(msg, step, total) {
-              setStatus(msg);
-              setProgress((step / total) * 100);
-            }
+          const seedVal = seedSelect.value === "random" ? Math.floor(Math.random() * 100000) : parseInt(seedSelect.value);
+
+          setStatus("Generating image (seed: " + seedVal + ")...");
+          setProgress(60);
+
+          const { promise } = client.generate({
+            prompt: prompt,
+            seed: seedVal,
+            width: 512,
+            height: 512,
           });
 
-          // Draw to canvas
-          const ctx = canvas.getContext("2d");
-          ctx.putImageData(imageData, 0, 0);
-          setStatus("Done! " + res + "×" + res + " image generated.");
-          setProgress(100);
+          const result = await promise;
 
+          if (result.ok) {
+            const url = URL.createObjectURL(result.blob);
+            outputImg.src = url;
+            outputImg.style.display = "block";
+            setStatus("Done! 512×512 image generated.");
+            setProgress(100);
+          } else {
+            setStatus("Generation failed: " + (result.error || "unknown error"));
+          }
         } catch (e) {
-          const msg = e ? (e.message || e.toString()) : "Unknown error";
-          setStatus("Generation failed: " + msg);
-          console.error("Full error:", e);
+          setStatus("Error: " + (e.message || e));
+          console.error("Generation error:", e);
         } finally {
           generateBtn.disabled = false;
           generateBtn.textContent = "Generate";
@@ -261,20 +201,5 @@
 
       init();
     </script>
-
-    <!-- ONNX Runtime Web with WebGPU -->
-    <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/ort.all.min.js"></script>
-    <script>
-      // Configure ONNX Runtime
-      if (typeof ort !== "undefined") {
-        ort.env.wasm.numThreads = 1; // Avoid cross-origin issues
-        ort.env.wasm.simd = true;
-        // Log available backends
-        console.log("ORT version:", ort.env.versions?.web || "unknown");
-        console.log("ORT backends:", Object.keys(ort.env));
-      }
-    </script>
-    <!-- Sana ONNX Pipeline -->
-    <script src="sana_pipeline.js"></script>
   </body>
 </html>
