@@ -1314,7 +1314,7 @@ class StableDiffusionInstance {
     this.requestInProgress = false;
     this.logger = console.log;
     this.collaborationManager = new CollaborativeGenerationManager((message) => this.logger(message));
-    this.model = "Stable-Diffusion-XL"
+    this.model = "Stable-Diffusion-1.5"
   }
   /**
    * Initialize TVM
@@ -1446,6 +1446,9 @@ class StableDiffusionInstance {
     }
     else{
       throw Error("Model not found");
+    }
+    if (!model_lib_url.startsWith("http")) {
+      model_lib_url = new URL(model_lib_url, document.URL).href;
     }
     this.config.wasmUrl = model_lib_url;
     this.config.cacheUrl = model_param_url;

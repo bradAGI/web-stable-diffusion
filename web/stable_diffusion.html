@@ -12,8 +12,9 @@
     </script>
     <div id="root"></div>
     <div id="modal-root"></div>
+    <script src="https://websd.mlc.ai/dist/tvmjs.bundle.js"></script>
     <script type="module">
-      import init, { TokenizerWasm } from "./dist/tokenizers-wasm/tokenizers_wasm.js";
+      import init, { TokenizerWasm } from "https://websd.mlc.ai/dist/tokenizers-wasm/tokenizers_wasm.js";
 
       let initialized = false;
       async function getTokenizer(name) {
@@ -31,7 +32,7 @@
     <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
     <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
-    <script src="dist/stable_diffusion.js"></script>
+    <script src="stable_diffusion.js"></script>
     <script type="text/babel" data-type="module" data-presets="env,react" src="app.jsx"></script>
   </body>
 </html>
