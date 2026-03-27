@@ -558,18 +558,8 @@ def export_text_encoder_only():
 
 @app.local_entrypoint()
 def main():
-    import sys
-    mode = sys.argv[1] if len(sys.argv) > 1 else "text-encoder"
-
-    if mode == "all":
-        print("Starting full Sana 0.6B compilation on Modal A100...")
-        compile_sana_to_wasm.remote()
-    elif mode == "text-encoder":
-        print("Exporting Gemma text encoder only...")
-        export_text_encoder_only.remote()
-    else:
-        print(f"Unknown mode: {mode}. Use 'all' or 'text-encoder'.")
-        return
-
-    print("\nDone! Download artifacts with:")
+    # Text encoder only — DiT/VAE already exported
+    print("Exporting Gemma text encoder only...")
+    export_text_encoder_only.remote()
+    print("\nDone! Download with:")
     print("  modal volume get sana-wasm-artifacts /artifacts/sana-wasm ./sana-wasm")
