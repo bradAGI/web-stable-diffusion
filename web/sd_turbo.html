@@ -76,8 +76,8 @@
     </div>
 
     <script type="module">
-      // Import web-txt2img from CDN
-      import { Txt2ImgWorkerClient } from 'https://esm.sh/web-txt2img@0.3.1';
+      // Import web-txt2img direct API (no worker needed)
+      import { loadModel, generateImage, isModelLoaded } from './node_modules/web-txt2img/dist/index.js';
 
       const statusEl = document.getElementById("status");
       const progressEl = document.getElementById("progress");
@@ -91,7 +91,6 @@
       function setStatus(msg) { statusEl.textContent = msg; }
       function setProgress(val) { progressEl.value = val; }
 
-      let client = null;
       let modelLoaded = false;
 
       // Detect GPU
@@ -133,16 +132,14 @@
       }
 
       async function ensureModel() {
-        if (client && modelLoaded) return;
+        if (modelLoaded && isModelLoaded("sd-turbo")) return;
 
         setStatus("Loading SD-Turbo model (250 MB, cached after first use)...");
         setProgress(10);
         generateBtn.disabled = true;
         generateBtn.textContent = "Loading model...";
 
-        client = Txt2ImgWorkerClient.createDefault();
-
-        await client.load("sd-turbo", {
+        await loadModel("sd-turbo", {
           backendPreference: ["webgpu"],
           progressCallback: (info) => {
             if (info.phase) setStatus("Loading: " + info.phase);
@@ -172,14 +169,12 @@
           setStatus("Generating image (seed: " + seedVal + ")...");
           setProgress(60);
 
-          const { promise } = client.generate({
+          const result = await generateImage({
             prompt: prompt,
             seed: seedVal,
             width: 512,
             height: 512,
           });
-
-          const result = await promise;
 
           if (result.ok) {
             const url = URL.createObjectURL(result.blob);
