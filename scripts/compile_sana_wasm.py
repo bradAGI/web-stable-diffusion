@@ -43,6 +43,7 @@ compiler_image = (
         "Pillow",
         "onnx",
         "onnxscript",
+        "onnxruntime-gpu",
     )
     .run_commands(
         # Install MLC AI nightly (CUDA 12.4) from direct URL
@@ -572,8 +573,8 @@ def export_text_encoder_quantized():
     print("Exporting Gemma text encoder — INT4 quantized")
     print("=" * 60)
 
-    out_path = f"{OUTPUT_DIR}/sana-wasm/sana_text_encoder_int4.onnx"
-    if os.path.exists(out_path):
+    out_path = f"{OUTPUT_DIR}/sana-wasm/sana_text_encoder_int8.onnx"
+    if os.path.exists(out_path) and os.path.getsize(out_path) > 1000:
         print(f"  Already exists: {out_path}, skipping.")
         return
 
@@ -607,24 +608,28 @@ def export_text_encoder_quantized():
 
     os.makedirs(f"{OUTPUT_DIR}/sana-wasm", exist_ok=True)
 
-    # Step 1: Export fp16 ONNX first (temporary)
-    fp16_path = f"{OUTPUT_DIR}/sana-wasm/_temp_text_encoder_fp16.onnx"
-    print("  Exporting fp16 ONNX (temporary)...")
-    with torch.no_grad():
-        torch.onnx.export(
-            text_enc_wrapper,
-            (dummy_input_ids, dummy_attention_mask),
-            fp16_path,
-            input_names=["input_ids", "attention_mask"],
-            output_names=["hidden_states"],
-            dynamic_axes={
-                "input_ids": {1: "seq_len"},
-                "attention_mask": {1: "seq_len"},
-                "hidden_states": {1: "seq_len"},
-            },
-            opset_version=18,
-        )
-    print("  ✓ fp16 export done")
+    # Step 1: Use existing fp16 ONNX if available, otherwise export
+    fp16_path = f"{OUTPUT_DIR}/sana-wasm/sana_text_encoder.onnx"
+    if os.path.exists(fp16_path) and os.path.getsize(fp16_path) > 1000:
+        print(f"  Using existing fp16 ONNX: {fp16_path}")
+    else:
+        fp16_path = f"{OUTPUT_DIR}/sana-wasm/_temp_text_encoder_fp16.onnx"
+        print("  Exporting fp16 ONNX...")
+        with torch.no_grad():
+            torch.onnx.export(
+                text_enc_wrapper,
+                (dummy_input_ids, dummy_attention_mask),
+                fp16_path,
+                input_names=["input_ids", "attention_mask"],
+                output_names=["hidden_states"],
+                dynamic_axes={
+                    "input_ids": {1: "seq_len"},
+                    "attention_mask": {1: "seq_len"},
+                    "hidden_states": {1: "seq_len"},
+                },
+                opset_version=18,
+            )
+        print("  ✓ fp16 export done")
 
     # Step 2: Quantize to int4 using onnxruntime
     print("  Quantizing to INT4...")
