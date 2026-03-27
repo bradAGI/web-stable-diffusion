@@ -139,13 +139,20 @@
         generateBtn.disabled = true;
         generateBtn.textContent = "Loading model...";
 
-        await loadModel("sd-turbo", {
+        const loadResult = await loadModel("sd-turbo", {
           backendPreference: ["webgpu"],
           progressCallback: (info) => {
+            console.log("Load progress:", info);
             if (info.phase) setStatus("Loading: " + info.phase);
             if (info.progress != null) setProgress(info.progress * 100);
           },
         });
+
+        console.log("Load result:", JSON.stringify(loadResult, null, 2));
+        if (loadResult && !loadResult.ok) {
+          setStatus("Model load failed: " + (loadResult.reason || loadResult.message || JSON.stringify(loadResult)));
+          return;
+        }
 
         modelLoaded = true;
         setStatus("Model loaded! Generating...");
@@ -177,6 +184,8 @@
             height: 512,
           });
 
+          console.log("Generate result:", JSON.stringify(result, null, 2));
+
           if (result.ok) {
             const url = URL.createObjectURL(result.blob);
             outputImg.src = url;
@@ -184,7 +193,7 @@
             setStatus("Done! 512×512 image generated.");
             setProgress(100);
           } else {
-            setStatus("Generation failed: " + (result.error || "unknown error"));
+            setStatus("Generation failed: " + (result.reason || result.error || result.message || JSON.stringify(result)));
           }
         } catch (e) {
           setStatus("Error: " + (e.message || e));
