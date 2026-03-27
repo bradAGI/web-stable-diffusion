@@ -58,6 +58,14 @@ compiler_image = (
 SANA_MODEL_ID = "Efficient-Large-Model/Sana_600M_1024px"
 OUTPUT_DIR = "/artifacts"
 
+# Compile variants for different GPU capabilities
+# Sana uses 32x compression, so latent = resolution / 32
+RESOLUTION_VARIANTS = [
+    {"name": "1024", "resolution": 1024, "latent_size": 32},
+    {"name": "2048", "resolution": 2048, "latent_size": 64},
+    {"name": "4096", "resolution": 4096, "latent_size": 128},
+]
+
 
 @app.function(
     image=compiler_image,
@@ -110,137 +118,100 @@ def compile_sana_to_wasm():
 
     os.makedirs(f"{OUTPUT_DIR}/sana-wasm", exist_ok=True)
 
-    # --- Trace DC-AE decoder ---
-    print("Tracing DC-AE decoder...")
     vae = pipe.vae
     vae.eval()
-
-    # Sana uses 32x compression, so 1024x1024 → 32x32 latent
-    latent_h, latent_w = 32, 32
-    latent_channels = pipe.transformer.config.in_channels
-
-    dummy_latent = torch.randn(1, latent_channels, latent_h, latent_w, dtype=torch.float16, device="cuda")
-
-    # Try tracing with torch.export or fx
-    try:
-        from torch.export import export
-        from tvm.relax.frontend.torch import from_exported_program
-
-        print("  Using torch.export path...")
-        with torch.no_grad():
-            exported_vae = export(vae.decode, (dummy_latent,))
-        vae_mod = from_exported_program(exported_vae, keep_params_as_input=True)
-        print("  DC-AE decoder traced successfully")
-    except Exception as e:
-        print(f"  torch.export failed ({e}), trying FX trace...")
-        import torch.fx
-        with torch.no_grad():
-            traced_vae = torch.fx.symbolic_trace(vae.decode)
-        vae_mod = from_fx(traced_vae, [(1, latent_channels, latent_h, latent_w)], keep_params_as_input=True)
-        print("  DC-AE decoder traced via FX")
-
-    # --- Trace Transformer (Linear DiT) ---
-    print("Tracing Linear DiT transformer...")
     transformer = pipe.transformer
     transformer.eval()
-
-    # Sana transformer inputs: hidden_states, encoder_hidden_states, timestep
-    dummy_hidden = torch.randn(1, latent_channels, latent_h, latent_w, dtype=torch.float16, device="cuda")
-    dummy_encoder_hidden = torch.randn(1, 300, transformer.config.cross_attention_dim, dtype=torch.float16, device="cuda")
-    dummy_timestep = torch.tensor([500.0], dtype=torch.float16, device="cuda")
-
-    try:
-        from torch.export import export
-        from tvm.relax.frontend.torch import from_exported_program
-
-        print("  Using torch.export path...")
-        with torch.no_grad():
-            exported_dit = export(
-                transformer,
-                (dummy_hidden, dummy_encoder_hidden, dummy_timestep),
-            )
-        dit_mod = from_exported_program(exported_dit, keep_params_as_input=True)
-        print("  Transformer traced successfully")
-    except Exception as e:
-        print(f"  torch.export failed ({e}), trying manual trace...")
-        # Fall back to manual tracing
-        print("  Attempting fx trace...")
-        try:
-            import torch.fx
-            with torch.no_grad():
-                traced_dit = torch.fx.symbolic_trace(transformer)
-            dit_mod = from_fx(
-                traced_dit,
-                [
-                    (1, latent_channels, latent_h, latent_w),
-                    (1, 300, transformer.config.cross_attention_dim),
-                    (1,),
-                ],
-                keep_params_as_input=True,
-            )
-            print("  Transformer traced via FX")
-        except Exception as e2:
-            print(f"  FX trace also failed: {e2}")
-            print("  Saving model state dicts for manual compilation...")
-            torch.save(transformer.state_dict(), f"{OUTPUT_DIR}/sana-wasm/transformer_state_dict.pt")
-            torch.save(vae.state_dict(), f"{OUTPUT_DIR}/sana-wasm/vae_state_dict.pt")
-            dit_mod = None
-
-    # ----------------------------------------------------------------
-    print("=" * 60)
-    print("Step 3: Compiling to WebGPU target")
-    print("=" * 60)
+    latent_channels = pipe.transformer.config.in_channels
 
     target = tvm.target.Target("webgpu", host="llvm -mtriple=wasm32-unknown-unknown-wasm")
 
-    modules_to_compile = {}
-    if vae_mod is not None:
-        modules_to_compile["vae"] = vae_mod
-    if dit_mod is not None:
-        modules_to_compile["dit"] = dit_mod
+    # Activate emscripten once
+    os.environ["EMSDK"] = "/opt/emsdk"
+    subprocess.run(["bash", "-c", "source /opt/emsdk/emsdk_env.sh"], check=True, capture_output=True)
 
-    for name, mod in modules_to_compile.items():
-        print(f"Compiling {name}...")
+    for variant in RESOLUTION_VARIANTS:
+        res_name = variant["name"]
+        latent_h = latent_w = variant["latent_size"]
 
-        # Apply optimizations
-        with tvm.transform.PassContext(opt_level=3):
-            mod = relax.transform.DecomposeOpsForInference()(mod)
-            mod = relax.transform.LegalizeOps()(mod)
+        print("=" * 60)
+        print(f"Compiling {res_name}x{res_name} variant (latent {latent_h}x{latent_w})")
+        print("=" * 60)
 
-        # MetaSchedule auto-tuning
-        print(f"  Auto-tuning {name} for WebGPU...")
+        variant_dir = f"{OUTPUT_DIR}/sana-wasm/{res_name}"
+        os.makedirs(variant_dir, exist_ok=True)
+
+        # --- Trace DC-AE decoder ---
+        print(f"  Tracing DC-AE decoder for {res_name}...")
+        dummy_latent = torch.randn(1, latent_channels, latent_h, latent_w, dtype=torch.float16, device="cuda")
+        vae_mod = None
         try:
-            from tvm import meta_schedule as ms
-
-            with ms.database.JSONDatabase(
-                f"{OUTPUT_DIR}/sana-wasm/{name}_tuning_db.json"
-            ) as db:
-                with target:
-                    mod = relax.transform.MetaScheduleApplyDatabase(db)(mod)
+            from torch.export import export
+            from tvm.relax.frontend.torch import from_exported_program
+            with torch.no_grad():
+                exported_vae = export(vae.decode, (dummy_latent,))
+            vae_mod = from_exported_program(exported_vae, keep_params_as_input=True)
+            print(f"  ✓ DC-AE decoder traced for {res_name}")
         except Exception as e:
-            print(f"  Auto-tuning skipped: {e}")
+            print(f"  torch.export failed ({e}), trying FX...")
+            try:
+                import torch.fx
+                with torch.no_grad():
+                    traced_vae = torch.fx.symbolic_trace(vae.decode)
+                vae_mod = from_fx(traced_vae, [(1, latent_channels, latent_h, latent_w)], keep_params_as_input=True)
+                print(f"  ✓ DC-AE decoder traced via FX for {res_name}")
+            except Exception as e2:
+                print(f"  ✗ VAE trace failed for {res_name}: {e2}")
 
-        # Build
-        print(f"  Building {name} WASM...")
+        # --- Trace Transformer ---
+        print(f"  Tracing Linear DiT for {res_name}...")
+        dummy_hidden = torch.randn(1, latent_channels, latent_h, latent_w, dtype=torch.float16, device="cuda")
+        dummy_encoder_hidden = torch.randn(1, 300, transformer.config.cross_attention_dim, dtype=torch.float16, device="cuda")
+        dummy_timestep = torch.tensor([500.0], dtype=torch.float16, device="cuda")
+        dit_mod = None
         try:
-            # Activate emscripten
-            os.environ["EMSDK"] = "/opt/emsdk"
-            subprocess.run(
-                ["bash", "-c", "source /opt/emsdk/emsdk_env.sh"],
-                check=True, capture_output=True,
-            )
-
-            lib = relax.build(mod, target=target)
-            wasm_path = f"{OUTPUT_DIR}/sana-wasm/sana_{name}.wasm"
-            lib.export_library(wasm_path)
-            print(f"  ✓ {name} compiled to {wasm_path}")
-            print(f"    Size: {os.path.getsize(wasm_path) / 1e6:.1f} MB")
+            from torch.export import export
+            from tvm.relax.frontend.torch import from_exported_program
+            with torch.no_grad():
+                exported_dit = export(transformer, (dummy_hidden, dummy_encoder_hidden, dummy_timestep))
+            dit_mod = from_exported_program(exported_dit, keep_params_as_input=True)
+            print(f"  ✓ Transformer traced for {res_name}")
         except Exception as e:
-            print(f"  ✗ Build failed: {e}")
-            # Save IR for debugging
-            with open(f"{OUTPUT_DIR}/sana-wasm/{name}_ir.txt", "w") as f:
-                f.write(str(mod))
-            print(f"  Saved IR to {name}_ir.txt for debugging")
+            print(f"  torch.export failed ({e}), trying FX...")
+            try:
+                import torch.fx
+                with torch.no_grad():
+                    traced_dit = torch.fx.symbolic_trace(transformer)
+                dit_mod = from_fx(
+                    traced_dit,
+                    [(1, latent_channels, latent_h, latent_w), (1, 300, transformer.config.cross_attention_dim), (1,)],
+                    keep_params_as_input=True,
+                )
+                print(f"  ✓ Transformer traced via FX for {res_name}")
+            except Exception as e2:
+                print(f"  ✗ Transformer trace failed for {res_name}: {e2}")
+
+        # --- Compile each module ---
+        for comp_name, mod in [("vae", vae_mod), ("dit", dit_mod)]:
+            if mod is None:
+                continue
+            print(f"  Compiling {comp_name} for {res_name}...")
+            try:
+                with tvm.transform.PassContext(opt_level=3):
+                    mod = relax.transform.DecomposeOpsForInference()(mod)
+                    mod = relax.transform.LegalizeOps()(mod)
+
+                lib = relax.build(mod, target=target)
+                wasm_path = f"{variant_dir}/sana_{comp_name}_{res_name}.wasm"
+                lib.export_library(wasm_path)
+                print(f"  ✓ {comp_name} → {wasm_path} ({os.path.getsize(wasm_path) / 1e6:.1f} MB)")
+            except Exception as e:
+                print(f"  ✗ {comp_name} build failed for {res_name}: {e}")
+                with open(f"{variant_dir}/{comp_name}_ir.txt", "w") as f:
+                    f.write(str(mod))
+
+        # Free GPU memory between variants
+        torch.cuda.empty_cache()
 
     # ----------------------------------------------------------------
     print("=" * 60)
@@ -318,25 +289,37 @@ def compile_sana_to_wasm():
     print("Step 5: Writing browser config")
     print("=" * 60)
 
+    variants_config = {}
+    for variant in RESOLUTION_VARIANTS:
+        res = variant["name"]
+        variants_config[res] = {
+            "resolution": variant["resolution"],
+            "latent_size": variant["latent_size"],
+            "transformer_wasm": f"{res}/sana_dit_{res}.wasm",
+            "vae_wasm": f"{res}/sana_vae_{res}.wasm",
+            "min_vram_gb": {
+                "1024": 3, "2048": 6, "4096": 16,
+            }.get(res, 3),
+        }
+
     config = {
         "model": "Sana-0.6B",
-        "resolution": 1024,
-        "latent_size": 32,
         "compression_ratio": 32,
-        "components": {
-            "transformer": {
-                "wasm": "sana_dit.wasm",
-                "params": "weight-shards/",
-            },
-            "vae_decoder": {
-                "wasm": "sana_vae.wasm",
-                "params": "weight-shards/",
-            },
-        },
+        "default_variant": "1024",
+        "variants": variants_config,
+        "params": "weight-shards/",
         "text_encoder": "google/gemma-2b",
         "scheduler": {
             "type": "flow-dpm-solver",
             "num_steps": 20,
+        },
+        "vram_auto_select": {
+            "description": "Browser auto-selects variant based on GPU VRAM",
+            "thresholds": [
+                {"min_vram_gb": 16, "variant": "4096"},
+                {"min_vram_gb": 6, "variant": "2048"},
+                {"min_vram_gb": 0, "variant": "1024"},
+            ],
         },
     }
     with open(f"{OUTPUT_DIR}/sana-wasm/sana-config.json", "w") as f:
