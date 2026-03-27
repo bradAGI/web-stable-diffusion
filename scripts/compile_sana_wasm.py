@@ -27,11 +27,9 @@ compiler_image = (
     .apt_install(
         "git", "cmake", "ninja-build", "build-essential",
         "wget", "curl", "unzip",
-        # Emscripten deps
-        "python3", "nodejs", "npm",
+        "nodejs", "npm",
     )
     .pip_install(
-        "mlc-ai-nightly",
         "torch>=2.1.0",
         "torchvision",
         "transformers>=4.38.0",
@@ -45,6 +43,8 @@ compiler_image = (
         "Pillow",
     )
     .run_commands(
+        # Install MLC AI / TVM Unity from official wheels
+        "pip install mlc-ai-nightly -f https://mlc.ai/wheels",
         # Install Emscripten
         "git clone https://github.com/emscripten-core/emsdk.git /opt/emsdk",
         "cd /opt/emsdk && ./emsdk install latest && ./emsdk activate latest",
