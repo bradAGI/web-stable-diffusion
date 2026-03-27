@@ -3,36 +3,49 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Web Stable Diffusion</title>
+    <title>Sana — Browser Image Generation</title>
     <style>
       * { box-sizing: border-box; margin: 0; padding: 0; }
       body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0a0a0a; color: #e0e0e0; min-height: 100vh; display: flex; flex-direction: column; align-items: center; }
-      h1 { font-size: 1.5rem; margin: 2rem 0 0.5rem; }
+      h1 { font-size: 1.5rem; margin: 2rem 0 0.25rem; }
       .subtitle { color: #888; font-size: 0.85rem; margin-bottom: 1.5rem; }
-      .container { width: 100%; max-width: 640px; padding: 0 1rem; }
+      .container { width: 100%; max-width: 700px; padding: 0 1rem; }
       .input-group { display: flex; flex-direction: column; gap: 0.5rem; margin-bottom: 1rem; }
+      .row { display: flex; gap: 1rem; }
+      .row .input-group { flex: 1; }
       label { font-size: 0.8rem; color: #aaa; }
-      textarea, input[type="text"] { background: #1a1a1a; border: 1px solid #333; border-radius: 8px; padding: 0.75rem; color: #fff; font-size: 0.9rem; resize: none; outline: none; }
-      textarea:focus, input:focus { border-color: #666; }
-      button { background: #fff; color: #000; border: none; border-radius: 8px; padding: 0.75rem 1.5rem; font-size: 0.9rem; font-weight: 600; cursor: pointer; transition: opacity 0.2s; }
+      textarea, input[type="text"], select {
+        background: #1a1a1a; border: 1px solid #333; border-radius: 8px;
+        padding: 0.75rem; color: #fff; font-size: 0.9rem; resize: none; outline: none;
+      }
+      select { cursor: pointer; }
+      textarea:focus, input:focus, select:focus { border-color: #666; }
+      .actions { display: flex; gap: 0.75rem; align-items: center; margin-bottom: 1rem; }
+      button {
+        background: #fff; color: #000; border: none; border-radius: 8px;
+        padding: 0.75rem 1.5rem; font-size: 0.9rem; font-weight: 600;
+        cursor: pointer; transition: opacity 0.2s;
+      }
       button:hover { opacity: 0.85; }
       button:disabled { opacity: 0.4; cursor: not-allowed; }
-      .canvas-wrap { margin: 1.5rem 0; display: flex; justify-content: center; }
-      canvas { border-radius: 8px; border: 1px solid #222; background: #111; }
+      .canvas-wrap { margin: 1rem 0 2rem; display: flex; justify-content: center; }
+      canvas { border-radius: 8px; border: 1px solid #222; background: #111; max-width: 100%; height: auto; }
       #status { font-size: 0.8rem; color: #888; margin-bottom: 0.5rem; min-height: 1.2em; }
       .progress-wrap { width: 100%; margin-bottom: 1rem; }
       progress { width: 100%; height: 6px; appearance: none; border: none; border-radius: 3px; overflow: hidden; }
       progress::-webkit-progress-bar { background: #222; border-radius: 3px; }
       progress::-webkit-progress-value { background: #fff; border-radius: 3px; }
       #gpu-status { font-size: 0.75rem; color: #666; margin-bottom: 1rem; }
+      .res-badge { font-size: 0.7rem; color: #666; margin-left: 0.25rem; }
+      .vram-note { font-size: 0.7rem; color: #555; margin-top: 0.25rem; }
     </style>
   </head>
   <body>
-    <h1>Web Stable Diffusion</h1>
-    <p class="subtitle">Runs entirely in your browser via WebGPU. No server needed.</p>
+    <h1>Sana 0.6B</h1>
+    <p class="subtitle">1024–4K image generation — runs entirely in your browser via WebGPU</p>
 
     <div class="container">
-      <div id="gpu-status">Checking WebGPU support...</div>
+      <div id="gpu-status">Detecting GPU...</div>
       <div id="status"></div>
       <div class="progress-wrap">
         <progress id="progress" value="0" max="100"></progress>
@@ -42,24 +55,109 @@
         <label for="prompt">Prompt</label>
         <textarea id="prompt" rows="3" placeholder="A photo of an astronaut riding a horse on mars">A photo of an astronaut riding a horse on mars</textarea>
       </div>
-      <div class="input-group">
-        <label for="neg-prompt">Negative prompt (optional)</label>
-        <input type="text" id="neg-prompt" placeholder="blurry, low quality" value="" />
+
+      <div class="row">
+        <div class="input-group">
+          <label for="neg-prompt">Negative prompt</label>
+          <input type="text" id="neg-prompt" placeholder="blurry, low quality" value="" />
+        </div>
+        <div class="input-group" style="max-width: 160px;">
+          <label for="resolution">Resolution</label>
+          <select id="resolution">
+            <option value="1024" selected>1024 × 1024</option>
+            <option value="2048">2048 × 2048</option>
+            <option value="4096">4096 × 4096</option>
+          </select>
+          <div class="vram-note" id="vram-note">~3 GB VRAM</div>
+        </div>
       </div>
 
-      <button id="generate-btn" disabled>Loading model...</button>
+      <div class="row">
+        <div class="input-group" style="max-width: 120px;">
+          <label for="steps">Steps</label>
+          <select id="steps">
+            <option value="10">10</option>
+            <option value="20" selected>20</option>
+            <option value="30">30</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="actions">
+        <button id="generate-btn" disabled>Detecting GPU...</button>
+      </div>
 
       <div class="canvas-wrap">
-        <canvas id="canvas" width="512" height="512"></canvas>
+        <canvas id="canvas" width="1024" height="1024"></canvas>
       </div>
     </div>
 
-    <!-- TVM runtime -->
     <script>
+      // ===== Resolution selector =====
+      const VRAM_MAP = { "1024": "~3 GB VRAM", "2048": "~6 GB VRAM", "4096": "~16 GB VRAM" };
+      const resSelect = document.getElementById("resolution");
+      const vramNote = document.getElementById("vram-note");
+      const canvas = document.getElementById("canvas");
+
+      resSelect.addEventListener("change", function() {
+        const res = parseInt(this.value);
+        vramNote.textContent = VRAM_MAP[this.value] || "";
+        canvas.width = res;
+        canvas.height = res;
+      });
+
+      // ===== GPU detection + auto-select best resolution =====
+      async function detectGPU() {
+        const gpuStatusEl = document.getElementById("gpu-status");
+        if (!navigator.gpu) {
+          gpuStatusEl.textContent = "WebGPU not supported in this browser.";
+          return null;
+        }
+        try {
+          const adapter = await navigator.gpu.requestAdapter();
+          if (!adapter) {
+            gpuStatusEl.textContent = "No WebGPU adapter found.";
+            return null;
+          }
+          const info = adapter.info || (adapter.requestAdapterInfo ? await adapter.requestAdapterInfo() : {});
+          const desc = info.description || info.vendor || "Unknown GPU";
+          const maxBuffer = adapter.limits.maxBufferSize;
+          const estimatedVRAM = maxBuffer / (1024 * 1024 * 1024); // rough GB estimate
+
+          gpuStatusEl.textContent = "GPU: " + desc + " (~" + estimatedVRAM.toFixed(1) + " GB buffer limit)";
+
+          // Auto-select best resolution based on estimated VRAM
+          if (estimatedVRAM >= 16) {
+            resSelect.value = "4096";
+          } else if (estimatedVRAM >= 6) {
+            resSelect.value = "2048";
+          } else {
+            resSelect.value = "1024";
+          }
+          resSelect.dispatchEvent(new Event("change"));
+
+          return { adapter, info, estimatedVRAM };
+        } catch (e) {
+          gpuStatusEl.textContent = "GPU detection failed: " + e.message;
+          return null;
+        }
+      }
+
+      // ===== Status helpers =====
+      const statusEl = document.getElementById("status");
+      const progressEl = document.getElementById("progress");
+      const generateBtn = document.getElementById("generate-btn");
+
+      function setStatus(msg) { statusEl.textContent = msg; }
+      function setProgress(val) { progressEl.value = val; }
+
+      // ===== Sana ONNX Runtime (placeholder — will be wired to onnxruntime-web) =====
+      // For now, hooks into the existing MLC/TVM SD 1.5 runtime as fallback.
+      // Once VAE ONNX is ready, this will be replaced with the Sana ONNX pipeline.
+
       var tvmjsGlobalEnv = tvmjsGlobalEnv || {};
 
-      // Polyfill: modern Chrome removed adapter.requestAdapterInfo() in favor of adapter.info
-      // The MLC CDN tvmjs.bundle.js calls the old API, so we shim it.
+      // Polyfill for old tvmjs
       if (typeof navigator !== "undefined" && navigator.gpu) {
         const origRequestAdapter = navigator.gpu.requestAdapter.bind(navigator.gpu);
         navigator.gpu.requestAdapter = async function(options) {
@@ -72,116 +170,79 @@
           return adapter;
         };
       }
-    </script>
-    <script src="https://websd.mlc.ai/dist/tvmjs_runtime.wasi.js"></script>
-    <script src="https://websd.mlc.ai/dist/tvmjs.bundle.js"></script>
 
-    <!-- Tokenizer WASM -->
-    <script type="module">
-      import init, { TokenizerWasm } from "https://websd.mlc.ai/dist/tokenizers-wasm/tokenizers_wasm.js";
-
-      let initialized = false;
-      async function getTokenizer(name) {
-        if (!initialized) {
-          await init();
-          initialized = true;
-        }
-        const response = await fetch("https://huggingface.co/" + name + "/raw/main/tokenizer.json");
-        const jsonText = await response.text();
-        return new TokenizerWasm(jsonText);
-      }
-
-      tvmjsGlobalEnv.getTokenizer = getTokenizer;
-
-      // Signal that tokenizer is ready
-      window.__tokenizerReady = true;
-      window.dispatchEvent(new Event("tokenizer-ready"));
-    </script>
-
-    <!-- SD pipeline runtime -->
-    <script src="stable_diffusion.js"></script>
-
-    <!-- App logic — hooks into the auto-created localStableDiffusionInst -->
-    <script>
-      const statusEl = document.getElementById("status");
-      const progressEl = document.getElementById("progress");
-      const gpuStatusEl = document.getElementById("gpu-status");
-      const generateBtn = document.getElementById("generate-btn");
-      const promptEl = document.getElementById("prompt");
-      const negPromptEl = document.getElementById("neg-prompt");
-
-      function setStatus(msg) { statusEl.textContent = msg; }
-      function setProgress(val) { progressEl.value = val; }
-
-      // Wire UI hooks that the SD runtime calls
-      tvmjsGlobalEnv.logMessage = function(msg) {
-        console.log(msg);
-        setStatus(msg);
-      };
-      tvmjsGlobalEnv.updateProgress = function(report) {
-        setStatus(report.text);
-        setProgress(report.progress * 100);
-      };
-      tvmjsGlobalEnv.updateGpuStatus = function(msg) {
-        gpuStatusEl.textContent = msg;
-      };
-
-      // The SD runtime reads prompt/settings via these hooks
-      tvmjsGlobalEnv.getPrompt = function() {
-        return promptEl.value.trim();
-      };
-      tvmjsGlobalEnv.getNegativePrompt = function() {
-        return negPromptEl.value.trim();
-      };
-      tvmjsGlobalEnv.getSchedulerId = function() {
-        return "0"; // DPM Solver
-      };
-      tvmjsGlobalEnv.getVaeCycle = function() {
-        return 5; // render preview every 5 UNet steps
-      };
+      // UI hooks for MLC runtime
+      tvmjsGlobalEnv.logMessage = function(msg) { console.log(msg); setStatus(msg); };
+      tvmjsGlobalEnv.updateProgress = function(report) { setStatus(report.text); setProgress(report.progress * 100); };
+      tvmjsGlobalEnv.updateGpuStatus = function(msg) { document.getElementById("gpu-status").textContent = msg; };
+      tvmjsGlobalEnv.getPrompt = function() { return document.getElementById("prompt").value.trim(); };
+      tvmjsGlobalEnv.getNegativePrompt = function() { return document.getElementById("neg-prompt").value.trim(); };
+      tvmjsGlobalEnv.getSchedulerId = function() { return "0"; };
+      tvmjsGlobalEnv.getVaeCycle = function() { return 5; };
       tvmjsGlobalEnv.onGenerationLifecycle = function(stage) {
-        if (stage === "start") {
-          generateBtn.disabled = true;
-          generateBtn.textContent = "Generating...";
-          setProgress(0);
-        } else if (stage === "complete") {
-          setStatus("Done!");
-          setProgress(100);
-        } else if (stage === "error") {
-          setStatus("Generation failed. Check console for details.");
-        } else if (stage === "end") {
-          generateBtn.disabled = false;
-          generateBtn.textContent = "Generate";
-        }
+        if (stage === "start") { generateBtn.disabled = true; generateBtn.textContent = "Generating..."; setProgress(0); }
+        else if (stage === "complete") { setStatus("Done!"); setProgress(100); }
+        else if (stage === "error") { setStatus("Generation failed. Check console."); }
+        else if (stage === "end") { generateBtn.disabled = false; generateBtn.textContent = "Generate"; }
       };
 
-      // The runtime auto-creates localStableDiffusionInst in stable_diffusion.js
-      // We just need to wait for tokenizer, then enable the button
-
-      function waitForReady() {
-        if (!window.__tokenizerReady) {
-          window.addEventListener("tokenizer-ready", onReady, { once: true });
-        } else {
-          onReady();
+      // ===== Init =====
+      async function init() {
+        const gpu = await detectGPU();
+        if (!gpu) {
+          setStatus("WebGPU not available. Cannot generate images locally.");
+          return;
         }
-      }
 
-      function onReady() {
-        setStatus("Ready! Enter a prompt and click Generate.");
+        setStatus("Ready! Select resolution and enter a prompt.");
         generateBtn.textContent = "Generate";
         generateBtn.disabled = false;
       }
 
       generateBtn.addEventListener("click", async function() {
-        if (typeof localStableDiffusionInst === "undefined") {
-          setStatus("SD runtime not loaded yet.");
-          return;
+        const res = parseInt(resSelect.value);
+        const steps = parseInt(document.getElementById("steps").value);
+        const prompt = document.getElementById("prompt").value.trim();
+        if (!prompt) { setStatus("Please enter a prompt."); return; }
+
+        generateBtn.disabled = true;
+        generateBtn.textContent = "Generating " + res + "×" + res + "...";
+        setProgress(0);
+
+        // Update canvas size
+        canvas.width = res;
+        canvas.height = res;
+
+        // TODO: Wire to Sana ONNX pipeline when VAE ONNX is ready.
+        // For now, fall back to MLC SD 1.5 at 512x512 if available.
+        if (typeof localStableDiffusionInst !== "undefined") {
+          setStatus("Using SD 1.5 fallback (Sana ONNX pipeline coming soon)...");
+          await localStableDiffusionInst.generate();
+        } else {
+          setStatus("Sana ONNX pipeline not loaded yet. Model files being compiled...");
+          generateBtn.disabled = false;
+          generateBtn.textContent = "Generate";
         }
-        // generate() reads prompt from the UI hooks we defined above
-        await localStableDiffusionInst.generate();
       });
 
-      waitForReady();
+      init();
     </script>
+
+    <!-- MLC/TVM fallback runtime (SD 1.5 @ 512x512) -->
+    <script src="https://websd.mlc.ai/dist/tvmjs_runtime.wasi.js"></script>
+    <script src="https://websd.mlc.ai/dist/tvmjs.bundle.js"></script>
+    <script type="module">
+      import init, { TokenizerWasm } from "https://websd.mlc.ai/dist/tokenizers-wasm/tokenizers_wasm.js";
+      let initialized = false;
+      async function getTokenizer(name) {
+        if (!initialized) { await init(); initialized = true; }
+        const response = await fetch("https://huggingface.co/" + name + "/raw/main/tokenizer.json");
+        return new TokenizerWasm(await response.text());
+      }
+      tvmjsGlobalEnv.getTokenizer = getTokenizer;
+      window.__tokenizerReady = true;
+      window.dispatchEvent(new Event("tokenizer-ready"));
+    </script>
+    <script src="stable_diffusion.js"></script>
   </body>
 </html>
