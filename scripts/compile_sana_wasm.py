@@ -107,7 +107,12 @@ def compile_sana_to_wasm():
     print("Step 2: Tracing model components with TorchDynamo → TVM")
     print("=" * 60)
 
-    import tvm
+    try:
+        import tvm
+    except ModuleNotFoundError:
+        # MLC AI nightly packages tvm under mlc_ai
+        import mlc_ai as _mlc  # noqa: F401 — registers tvm into sys.modules
+        import tvm
     from tvm import relax
     from tvm.relax.frontend.torch import from_fx
 
