@@ -41,6 +41,8 @@ compiler_image = (
         "huggingface_hub",
         "numpy<2.0",
         "Pillow",
+        "onnx",
+        "onnxscript",
     )
     .run_commands(
         # Install MLC AI nightly (CUDA 12.4) from direct URL
@@ -143,7 +145,8 @@ def compile_sana_to_wasm():
             self.vae = vae_model
 
         def forward(self, latent):
-            return self.vae.decode(latent).sample
+            # DC-AE may have mixed precision — use float32 for tracing
+            return self.vae.decode(latent.float()).sample.half()
 
     # Wrap transformer for tracing (disable control flow)
     class TransformerWrapper(torch.nn.Module):
@@ -161,6 +164,12 @@ def compile_sana_to_wasm():
 
     vae_wrapper = VAEDecodeWrapper(vae).cuda().half().eval()
     dit_wrapper = TransformerWrapper(transformer).cuda().half().eval()
+
+    # Get the correct text encoder hidden size from model config
+    # Sana uses Gemma text encoder — caption_projection expects its hidden dim
+    text_hidden_size = transformer.config.caption_channels
+    print(f"  Text encoder hidden size (caption_channels): {text_hidden_size}")
+    print(f"  Cross attention dim: {transformer.config.cross_attention_dim}")
 
     for variant in RESOLUTION_VARIANTS:
         res_name = variant["name"]
@@ -213,10 +222,9 @@ def compile_sana_to_wasm():
         # --- Trace Transformer ---
         print(f"  Tracing Linear DiT for {res_name}...")
         dummy_hidden = torch.randn(1, latent_channels, latent_h, latent_w, dtype=torch.float16, device="cuda")
-        # Get the correct text encoder hidden size from the model config
-        cross_attn_dim = transformer.config.cross_attention_dim
+        # caption_projection.linear_1 expects (batch, seq, caption_channels)
         max_seq_len = 300  # Sana uses max 300 text tokens
-        dummy_encoder_hidden = torch.randn(1, max_seq_len, cross_attn_dim, dtype=torch.float16, device="cuda")
+        dummy_encoder_hidden = torch.randn(1, max_seq_len, text_hidden_size, dtype=torch.float16, device="cuda")
         dummy_timestep = torch.tensor([500.0], dtype=torch.float16, device="cuda")
         dit_mod = None
         try:
@@ -227,7 +235,7 @@ def compile_sana_to_wasm():
             fx_dit = torch.fx.symbolic_trace(traced_dit)
             dit_mod = from_fx(
                 fx_dit,
-                [(1, latent_channels, latent_h, latent_w), (1, max_seq_len, cross_attn_dim), (1,)],
+                [(1, latent_channels, latent_h, latent_w), (1, max_seq_len, text_hidden_size), (1,)],
                 keep_params_as_input=True,
             )
             print(f"  ✓ Transformer traced for {res_name}")
