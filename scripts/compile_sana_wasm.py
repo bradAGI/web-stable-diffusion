@@ -748,6 +748,17 @@ def export_dit_float32_only():
                 opset_version=14,
                 dynamo=False,
             )
+        # Consolidate external data into a single .data file
+        import onnx
+        from onnx.external_data_helper import convert_model_to_external_data
+        model = onnx.load(onnx_path, load_external_data=True)
+        data_file = f"sana_dit_{res_name}.onnx.data"
+        convert_model_to_external_data(model, all_tensors_to_one_file=True, location=data_file)
+        # Clean up individual weight files
+        import glob
+        for f in glob.glob(f"{variant_dir}/onnx__*") + glob.glob(f"{variant_dir}/dit.*"):
+            os.remove(f)
+        onnx.save(model, onnx_path)
         size = os.path.getsize(onnx_path) / 1e6
         data_file = onnx_path + ".data"
         if os.path.exists(data_file):
