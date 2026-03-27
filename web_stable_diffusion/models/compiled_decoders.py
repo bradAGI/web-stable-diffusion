@@ -1,9 +1,8 @@
-"""Deterministic ONNX/TVM decoder stubs for omni-modal generation.
+"""Deterministic decoder stubs for non-image modalities.
 
-This module provides lightweight compiled-graph facsimiles that mimic the
-behaviour of ONNX and TVM exported decoder weights.  The actual numerical
-payloads are tiny and deterministic so that unit tests can validate the wiring
-logic without requiring heavyweight runtimes.
+These stubs provide lightweight embedding modulation for audio, volume, and
+video generation.  Image generation bypasses these entirely when the Diffusers
+backend is active.  Future work should replace these with real decoder models.
 """
 from __future__ import annotations
 

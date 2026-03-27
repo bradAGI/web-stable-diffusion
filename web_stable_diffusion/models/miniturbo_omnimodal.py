@@ -450,6 +450,13 @@ class OmniModalMiniturbo:
 
     # -- Prompt processing -------------------------------------------------
     def _prompt_embedding(self, prompt: str, size: int = 8) -> np.ndarray:
+        """Create a deterministic omni-modal embedding from the prompt text.
+
+        The base embedding is derived from a hash of the prompt.  When the
+        symbolic reasoning layer is available, deduced facts are blended in
+        so that thematic cues (e.g. "night", "ocean") influence all downstream
+        modalities consistently.
+        """
         base_embedding = _hash_embedding(prompt, size)
         knowledge, facts = _prompt_knowledge(prompt)
         derived = sorted(self.meta_logic.deduce(knowledge, facts))
@@ -550,7 +557,10 @@ class OmniModalMiniturbo:
         if not _DIFFUSERS_BACKEND_AVAILABLE or DiffusersImageBackend is None:
             return None
         try:
+            # Try environment config first, fall back to default model
             backend = DiffusersImageBackend.from_environment()
+            if backend is None:
+                backend = DiffusersImageBackend.from_default()
         except Exception as exc:  # pragma: no cover - defensive
             logger.warning("Failed to initialise diffusers backend: %s", exc)
             return None
@@ -559,13 +569,20 @@ class OmniModalMiniturbo:
         logger.info("Diffusers backend enabled using model '%s'", backend.config.model)
         return backend
 
-    def generate_image(self, prompt: str, resolution: int = 256) -> DeviceAwareResult:
+    def generate_image(
+        self,
+        prompt: str,
+        resolution: int = 256,
+        negative_prompt: Optional[str] = None,
+    ) -> DeviceAwareResult:
         prompt = self._ensure_prompt(prompt)
         resolution = self._ensure_positive(resolution, "resolution", minimum=16)
         embedding = self._prompt_embedding(prompt, size=12)
         conditioned_embedding, decoder_meta = self._modulate_embedding(prompt, "image", embedding)
         if self._image_backend is not None:
-            backend_result = self._image_backend.generate(prompt, resolution)
+            backend_result = self._image_backend.generate(
+                prompt, resolution, negative_prompt=negative_prompt,
+            )
             image = backend_result["array"]
             metadata = backend_result["metadata"]
         else:

@@ -16,7 +16,9 @@ setup(
     install_requires = [
         "torch",
         "diffusers",
-        "transformers"
+        "transformers",
+        "accelerate",
+        "safetensors",
     ],
     entry_points={
         "console_scripts": [

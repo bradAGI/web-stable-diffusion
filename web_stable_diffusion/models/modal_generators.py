@@ -198,14 +198,28 @@ class AudioGenerator(DeviceAwareGenerator):
 
 
 class ImageGenerator(DeviceAwareGenerator):
-    """Prototype image generator producing deterministic 2D tensors."""
+    """Image generator using Diffusers when available, falling back to synthetic."""
 
-    def generate(self, prompt: str, resolution: int = 32) -> DeviceAwareResult:
+    def __init__(self, device_spec: DeviceSpec | None = None) -> None:
+        super().__init__(device_spec)
+        self._backend = None
+        try:
+            from .backends import DiffusersImageBackend
+            self._backend = DiffusersImageBackend.from_environment() or DiffusersImageBackend.from_default()
+        except Exception:
+            pass
+
+    def generate(self, prompt: str, resolution: int = 512) -> DeviceAwareResult:
+        if self._backend:
+            result = self._backend.generate(prompt, resolution)
+            return self._pack_result(result["array"], result["metadata"])
+        # Fall back to synthetic
         pixels = _image_tensor(prompt, resolution, resolution)
         metadata = {
             "dtype": str(pixels.dtype),
             "shape": pixels.shape,
             "resolution": resolution,
+            "backend": "synthetic",
         }
         return self._pack_result(pixels, metadata)
 

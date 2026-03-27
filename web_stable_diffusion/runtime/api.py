@@ -563,7 +563,7 @@ def _error_response(exc: Exception) -> Dict[str, Any]:
 
 class GenerateRequest(BaseModel):
     prompt: str = Field(..., min_length=1)
-    resolution: int = Field(256, ge=16, le=1024)
+    resolution: int = Field(512, ge=16, le=1024)
     frames: int = Field(16, ge=1, le=256)
     volume_size: int = Field(32, ge=8, le=256)
     audio_length: int = Field(2048, ge=16, le=65536)
