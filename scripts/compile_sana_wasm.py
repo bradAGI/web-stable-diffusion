@@ -39,14 +39,14 @@ compiler_image = (
         "sentencepiece",
         "protobuf",
         "huggingface_hub",
-        "numpy",
+        "numpy<2.0",
         "Pillow",
     )
     .run_commands(
-        # Install Apache TVM from pip (stable release with WebGPU support)
-        "pip install apache-tvm",
-        # Verify TVM installed correctly
-        "python -c 'import tvm; print(\"TVM version:\", tvm.__version__)'",
+        # Install MLC AI nightly (CUDA 12.4) from direct URL
+        "pip install https://github.com/mlc-ai/package/releases/download/v0.9.dev0/mlc_ai_nightly_cu124-0.24.dev0-py3-none-manylinux_2_28_x86_64.whl",
+        # Debug: find what the package installs
+        "pip show mlc-ai-nightly-cu124 && python -c 'import importlib; import pkgutil; [print(m.name) for m in pkgutil.iter_modules() if \"tvm\" in m.name or \"mlc\" in m.name]'",
         # Install Emscripten
         "git clone https://github.com/emscripten-core/emsdk.git /opt/emsdk",
         "cd /opt/emsdk && ./emsdk install latest && ./emsdk activate latest",
