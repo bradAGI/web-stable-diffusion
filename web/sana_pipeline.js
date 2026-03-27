@@ -123,8 +123,9 @@ class SanaPipeline {
     if (onProgress) onProgress("Encoding text with CLIP...", 0, totalSteps);
     const clipEmbedding = await this._encodeTextCLIP(prompt);
 
-    // Project CLIP 768-dim → Sana 2304-dim (3x repeat + noise)
+    // Project CLIP 768-dim → Sana 2304-dim (3x repeat)
     const sanaEmbedding = this._projectCLIPToSana(clipEmbedding, 300, 2304);
+    console.log("Sana embedding size:", sanaEmbedding.length, "expected:", 300 * 2304);
 
     // Step 2: Create random latent noise
     const latent = this._createNoise(1, latentChannels, latentSize, latentSize, seed);
@@ -141,7 +142,10 @@ class SanaPipeline {
         if (name.includes("hidden") || name === "hidden_states") {
           feeds[name] = new this.ort.Tensor("float16", new Uint16Array(this._f32ToF16(currentLatent)), [1, latentChannels, latentSize, latentSize]);
         } else if (name.includes("encoder") || name === "encoder_hidden_states") {
-          feeds[name] = new this.ort.Tensor("float16", new Uint16Array(this._f32ToF16(sanaEmbedding)), [1, 300, 2304]);
+          // Must be rank 3: [batch, seq_len, hidden_dim]
+          const embF16 = new Uint16Array(this._f32ToF16(sanaEmbedding));
+          feeds[name] = new this.ort.Tensor("float16", embF16, [1, 300, 2304]);
+          console.log("encoder_hidden_states shape:", [1, 300, 2304], "data length:", embF16.length);
         } else if (name.includes("time") || name === "timestep") {
           feeds[name] = new this.ort.Tensor("float16", new Uint16Array(this._f32ToF16(new Float32Array([timestep]))), [1]);
         }
@@ -221,37 +225,24 @@ class SanaPipeline {
 
     const output = await this.clipSession.run(feeds);
 
-    // CLIP outputs: text_embeds, text_model_output.last_hidden_state, etc.
-    // We want the last_hidden_state (per-token embeddings), not the pooled output
-    let hiddenStates = null;
-    for (const [key, val] of Object.entries(output)) {
-      const shape = val.dims || [];
-      // Look for [1, 77, 768] shaped output (per-token hidden states)
-      if (shape.length === 3 && shape[1] === maxLen) {
-        hiddenStates = val.cpuData || val.data;
-        console.log("Using CLIP output:", key, "shape:", shape);
-        break;
-      }
-    }
-
-    if (!hiddenStates) {
-      // Fall back to any 3D output
-      for (const [key, val] of Object.entries(output)) {
-        if ((val.dims || []).length === 3) {
-          hiddenStates = val.cpuData || val.data;
-          console.log("Fallback CLIP output:", key, "shape:", val.dims);
-          break;
-        }
-      }
-    }
-
-    if (!hiddenStates) {
-      console.warn("No suitable CLIP hidden states found, outputs:", Object.keys(output));
-      // Return zeros
+    // CLIP outputs: text_embeds [1, 768], logits_per_text, etc.
+    // Use text_embeds (pooled) and expand to sequence length
+    const textEmbeds = output["text_embeds"];
+    if (!textEmbeds) {
+      console.warn("No text_embeds in CLIP output, keys:", Object.keys(output));
       return new Float32Array(maxLen * 768);
     }
 
-    return hiddenStates instanceof Float32Array ? hiddenStates : new Float32Array(hiddenStates);
+    const embedData = textEmbeds.cpuData || textEmbeds.data;
+    const f32Embed = embedData instanceof Float32Array ? embedData : new Float32Array(embedData);
+    console.log("CLIP text_embeds shape:", textEmbeds.dims, "values sample:", f32Embed.slice(0, 5));
+
+    // Expand pooled [768] embedding to sequence [77, 768] by repeating
+    const expanded = new Float32Array(maxLen * 768);
+    for (let s = 0; s < maxLen; s++) {
+      expanded.set(f32Embed.slice(0, 768), s * 768);
+    }
+    return expanded;
   }
 
   /**
