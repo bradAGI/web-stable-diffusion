@@ -85,7 +85,7 @@
     <!-- SD pipeline runtime -->
     <script src="stable_diffusion.js"></script>
 
-    <!-- App logic (no JSX, no Babel needed) -->
+    <!-- App logic — hooks into the auto-created localStableDiffusionInst -->
     <script>
       const statusEl = document.getElementById("status");
       const progressEl = document.getElementById("progress");
@@ -97,7 +97,7 @@
       function setStatus(msg) { statusEl.textContent = msg; }
       function setProgress(val) { progressEl.value = val; }
 
-      // Hook into the SD runtime's UI callbacks
+      // Wire UI hooks that the SD runtime calls
       tvmjsGlobalEnv.logMessage = function(msg) {
         console.log(msg);
         setStatus(msg);
@@ -109,77 +109,63 @@
       tvmjsGlobalEnv.updateGpuStatus = function(msg) {
         gpuStatusEl.textContent = msg;
       };
-      tvmjsGlobalEnv.updateGenerateProgress = function(step, total) {
-        const pct = Math.round((step / total) * 100);
-        setProgress(pct);
-        setStatus("Generating... step " + step + "/" + total);
+
+      // The SD runtime reads prompt/settings via these hooks
+      tvmjsGlobalEnv.getPrompt = function() {
+        return promptEl.value.trim();
+      };
+      tvmjsGlobalEnv.getNegativePrompt = function() {
+        return negPromptEl.value.trim();
+      };
+      tvmjsGlobalEnv.getSchedulerId = function() {
+        return "0"; // DPM Solver
+      };
+      tvmjsGlobalEnv.getVaeCycle = function() {
+        return -1;
+      };
+      tvmjsGlobalEnv.onGenerationLifecycle = function(stage) {
+        if (stage === "start") {
+          generateBtn.disabled = true;
+          generateBtn.textContent = "Generating...";
+          setProgress(0);
+        } else if (stage === "complete") {
+          setStatus("Done!");
+          setProgress(100);
+        } else if (stage === "error") {
+          setStatus("Generation failed. Check console for details.");
+        } else if (stage === "end") {
+          generateBtn.disabled = false;
+          generateBtn.textContent = "Generate";
+        }
       };
 
-      let sdInstance = null;
+      // The runtime auto-creates localStableDiffusionInst in stable_diffusion.js
+      // We just need to wait for tokenizer, then enable the button
 
-      async function initSD() {
-        // Wait for tokenizer to be ready
+      function waitForReady() {
         if (!window.__tokenizerReady) {
-          await new Promise(resolve => {
-            window.addEventListener("tokenizer-ready", resolve, { once: true });
-          });
-        }
-
-        setStatus("Initializing Stable Diffusion...");
-        generateBtn.textContent = "Loading model...";
-
-        sdInstance = new StableDiffusionInstance();
-
-        try {
-          await sdInstance.init();
-          setStatus("Ready! Enter a prompt and click Generate.");
-          generateBtn.textContent = "Generate";
-          generateBtn.disabled = false;
-        } catch (err) {
-          setStatus("Failed to initialize: " + err.message);
-          gpuStatusEl.textContent = "Error: " + err.message;
-          console.error(err);
+          window.addEventListener("tokenizer-ready", onReady, { once: true });
+        } else {
+          onReady();
         }
       }
 
-      generateBtn.addEventListener("click", async function() {
-        if (!sdInstance) return;
+      function onReady() {
+        setStatus("Ready! Enter a prompt and click Generate.");
+        generateBtn.textContent = "Generate";
+        generateBtn.disabled = false;
+      }
 
-        const prompt = promptEl.value.trim();
-        if (!prompt) {
-          setStatus("Please enter a prompt.");
+      generateBtn.addEventListener("click", async function() {
+        if (typeof localStableDiffusionInst === "undefined") {
+          setStatus("SD runtime not loaded yet.");
           return;
         }
-        const negPrompt = negPromptEl.value.trim();
-
-        generateBtn.disabled = true;
-        generateBtn.textContent = "Generating...";
-        setProgress(0);
-        setStatus("Starting generation...");
-
-        try {
-          await sdInstance.generate(
-            prompt,
-            negPrompt,
-            function(stage, step, total, totalSteps) {
-              const pct = Math.round(((step + 1) / totalSteps) * 100);
-              setProgress(pct);
-              setStatus(stage + " - step " + (step + 1) + "/" + totalSteps);
-            }
-          );
-          setStatus("Done!");
-          setProgress(100);
-        } catch (err) {
-          setStatus("Generation failed: " + err.message);
-          console.error(err);
-        } finally {
-          generateBtn.disabled = false;
-          generateBtn.textContent = "Generate";
-        }
+        // generate() reads prompt from the UI hooks we defined above
+        await localStableDiffusionInst.generate();
       });
 
-      // Start initialization
-      initSD();
+      waitForReady();
     </script>
   </body>
 </html>
