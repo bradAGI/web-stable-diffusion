@@ -151,42 +151,10 @@
       function setStatus(msg) { statusEl.textContent = msg; }
       function setProgress(val) { progressEl.value = val; }
 
-      // ===== Sana ONNX Runtime (placeholder — will be wired to onnxruntime-web) =====
-      // For now, hooks into the existing MLC/TVM SD 1.5 runtime as fallback.
-      // Once VAE ONNX is ready, this will be replaced with the Sana ONNX pipeline.
+      // ===== Sana ONNX Pipeline =====
+      let sanaPipeline = null;
+      let currentVariant = null;
 
-      var tvmjsGlobalEnv = tvmjsGlobalEnv || {};
-
-      // Polyfill for old tvmjs
-      if (typeof navigator !== "undefined" && navigator.gpu) {
-        const origRequestAdapter = navigator.gpu.requestAdapter.bind(navigator.gpu);
-        navigator.gpu.requestAdapter = async function(options) {
-          const adapter = await origRequestAdapter(options);
-          if (adapter && !adapter.requestAdapterInfo) {
-            adapter.requestAdapterInfo = async function() {
-              return adapter.info || { vendor: "unknown", architecture: "", device: "", description: "" };
-            };
-          }
-          return adapter;
-        };
-      }
-
-      // UI hooks for MLC runtime
-      tvmjsGlobalEnv.logMessage = function(msg) { console.log(msg); setStatus(msg); };
-      tvmjsGlobalEnv.updateProgress = function(report) { setStatus(report.text); setProgress(report.progress * 100); };
-      tvmjsGlobalEnv.updateGpuStatus = function(msg) { document.getElementById("gpu-status").textContent = msg; };
-      tvmjsGlobalEnv.getPrompt = function() { return document.getElementById("prompt").value.trim(); };
-      tvmjsGlobalEnv.getNegativePrompt = function() { return document.getElementById("neg-prompt").value.trim(); };
-      tvmjsGlobalEnv.getSchedulerId = function() { return "0"; };
-      tvmjsGlobalEnv.getVaeCycle = function() { return 5; };
-      tvmjsGlobalEnv.onGenerationLifecycle = function(stage) {
-        if (stage === "start") { generateBtn.disabled = true; generateBtn.textContent = "Generating..."; setProgress(0); }
-        else if (stage === "complete") { setStatus("Done!"); setProgress(100); }
-        else if (stage === "error") { setStatus("Generation failed. Check console."); }
-        else if (stage === "end") { generateBtn.disabled = false; generateBtn.textContent = "Generate"; }
-      };
-
-      // ===== Init =====
       async function init() {
         const gpu = await detectGPU();
         if (!gpu) {
@@ -199,10 +167,34 @@
         generateBtn.disabled = false;
       }
 
+      async function ensurePipeline(variant) {
+        if (currentVariant === variant && sanaPipeline) return;
+
+        // Dispose old pipeline if switching resolution
+        if (sanaPipeline) {
+          await sanaPipeline.dispose();
+        }
+
+        sanaPipeline = new SanaPipeline();
+        setStatus("Loading Sana " + variant + "×" + variant + " model...");
+        generateBtn.disabled = true;
+        generateBtn.textContent = "Loading model...";
+
+        await sanaPipeline.init(variant, {
+          onProgress: function(msg, step, total) {
+            setStatus(msg);
+            setProgress((step / total) * 100);
+          }
+        });
+
+        currentVariant = variant;
+      }
+
       generateBtn.addEventListener("click", async function() {
-        const res = parseInt(resSelect.value);
+        const res = resSelect.value;
         const steps = parseInt(document.getElementById("steps").value);
         const prompt = document.getElementById("prompt").value.trim();
+        const negPrompt = document.getElementById("neg-prompt").value.trim();
         if (!prompt) { setStatus("Please enter a prompt."); return; }
 
         generateBtn.disabled = true;
@@ -210,16 +202,34 @@
         setProgress(0);
 
         // Update canvas size
-        canvas.width = res;
-        canvas.height = res;
+        const resolution = parseInt(res);
+        canvas.width = resolution;
+        canvas.height = resolution;
 
-        // TODO: Wire to Sana ONNX pipeline when VAE ONNX is ready.
-        // For now, fall back to MLC SD 1.5 at 512x512 if available.
-        if (typeof localStableDiffusionInst !== "undefined") {
-          setStatus("Using SD 1.5 fallback (Sana ONNX pipeline coming soon)...");
-          await localStableDiffusionInst.generate();
-        } else {
-          setStatus("Sana ONNX pipeline not loaded yet. Model files being compiled...");
+        try {
+          // Load pipeline if needed
+          await ensurePipeline(res);
+
+          // Generate
+          const imageData = await sanaPipeline.generate(prompt, {
+            negativePrompt: negPrompt,
+            steps: steps,
+            onProgress: function(msg, step, total) {
+              setStatus(msg);
+              setProgress((step / total) * 100);
+            }
+          });
+
+          // Draw to canvas
+          const ctx = canvas.getContext("2d");
+          ctx.putImageData(imageData, 0, 0);
+          setStatus("Done! " + res + "×" + res + " image generated.");
+          setProgress(100);
+
+        } catch (e) {
+          setStatus("Generation failed: " + e.message);
+          console.error(e);
+        } finally {
           generateBtn.disabled = false;
           generateBtn.textContent = "Generate";
         }
@@ -228,21 +238,9 @@
       init();
     </script>
 
-    <!-- MLC/TVM fallback runtime (SD 1.5 @ 512x512) -->
-    <script src="https://websd.mlc.ai/dist/tvmjs_runtime.wasi.js"></script>
-    <script src="https://websd.mlc.ai/dist/tvmjs.bundle.js"></script>
-    <script type="module">
-      import init, { TokenizerWasm } from "https://websd.mlc.ai/dist/tokenizers-wasm/tokenizers_wasm.js";
-      let initialized = false;
-      async function getTokenizer(name) {
-        if (!initialized) { await init(); initialized = true; }
-        const response = await fetch("https://huggingface.co/" + name + "/raw/main/tokenizer.json");
-        return new TokenizerWasm(await response.text());
-      }
-      tvmjsGlobalEnv.getTokenizer = getTokenizer;
-      window.__tokenizerReady = true;
-      window.dispatchEvent(new Event("tokenizer-ready"));
-    </script>
-    <script src="stable_diffusion.js"></script>
+    <!-- ONNX Runtime Web with WebGPU -->
+    <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.21.0/dist/ort.webgpu.min.js"></script>
+    <!-- Sana ONNX Pipeline -->
+    <script src="sana_pipeline.js"></script>
   </body>
 </html>
