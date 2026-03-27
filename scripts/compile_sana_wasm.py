@@ -122,6 +122,58 @@ def compile_sana_to_wasm():
 
     os.makedirs(f"{OUTPUT_DIR}/sana-wasm", exist_ok=True)
 
+    # ----------------------------------------------------------------
+    # Export text encoder (Gemma) — shared across all resolutions
+    # ----------------------------------------------------------------
+    print("Exporting Gemma text encoder to ONNX...")
+    text_encoder = pipe.text_encoder
+    text_encoder.eval()
+    tokenizer = pipe.tokenizer
+
+    class TextEncoderWrapper(torch.nn.Module):
+        def __init__(self, encoder):
+            super().__init__()
+            self.encoder = encoder
+
+        def forward(self, input_ids, attention_mask):
+            outputs = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
+            return outputs.last_hidden_state
+
+    text_enc_wrapper = TextEncoderWrapper(text_encoder).cuda().half().eval()
+
+    # Sana uses max 300 tokens
+    max_seq_len = 300
+    dummy_input_ids = torch.ones(1, max_seq_len, dtype=torch.long, device="cuda")
+    dummy_attention_mask = torch.ones(1, max_seq_len, dtype=torch.long, device="cuda")
+
+    text_enc_onnx_path = f"{OUTPUT_DIR}/sana-wasm/sana_text_encoder.onnx"
+    try:
+        with torch.no_grad():
+            torch.onnx.export(
+                text_enc_wrapper,
+                (dummy_input_ids, dummy_attention_mask),
+                text_enc_onnx_path,
+                input_names=["input_ids", "attention_mask"],
+                output_names=["hidden_states"],
+                dynamic_axes={
+                    "input_ids": {1: "seq_len"},
+                    "attention_mask": {1: "seq_len"},
+                    "hidden_states": {1: "seq_len"},
+                },
+                opset_version=18,
+            )
+        enc_size = os.path.getsize(text_enc_onnx_path) / 1e6
+        data_path = text_enc_onnx_path + ".data"
+        if os.path.exists(data_path):
+            enc_size += os.path.getsize(data_path) / 1e6
+        print(f"  ✓ Text encoder exported: {text_enc_onnx_path} ({enc_size:.0f} MB)")
+    except Exception as e:
+        print(f"  ✗ Text encoder export failed: {e}")
+
+    # Save tokenizer config for browser use
+    tokenizer.save_pretrained(f"{OUTPUT_DIR}/sana-wasm/tokenizer")
+    print("  ✓ Tokenizer saved")
+
     vae = pipe.vae
     vae.eval()
     transformer = pipe.transformer
