@@ -138,9 +138,10 @@ class SanaPipeline {
       const timestep = 1.0 - (step / steps);
 
       const feeds = {};
-      feeds["hidden_states"] = new this.ort.Tensor("float16", new Uint16Array(this._f32ToF16(currentLatent)), [1, latentChannels, latentSize, latentSize]);
-      feeds["encoder_hidden_states"] = new this.ort.Tensor("float16", new Uint16Array(this._f32ToF16(sanaEmbedding)), [1, 300, 2304]);
-      feeds["timestep"] = new this.ort.Tensor("float16", new Uint16Array(this._f32ToF16(new Float32Array([timestep]))), [1]);
+      // DiT exported as float32 for numerical stability
+      feeds["hidden_states"] = new this.ort.Tensor("float32", new Float32Array(currentLatent), [1, latentChannels, latentSize, latentSize]);
+      feeds["encoder_hidden_states"] = new this.ort.Tensor("float32", new Float32Array(sanaEmbedding), [1, 300, 2304]);
+      feeds["timestep"] = new this.ort.Tensor("float32", new Float32Array([timestep]), [1]);
 
       // Log all feed shapes before running
       for (const [k, v] of Object.entries(feeds)) {
