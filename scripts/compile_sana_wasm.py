@@ -43,10 +43,10 @@ compiler_image = (
         "Pillow",
     )
     .run_commands(
-        # Install MLC AI / TVM Unity — try cu124 wheel, then cpu fallback
-        "pip install --verbose mlc-ai-nightly-cu124 -f https://mlc.ai/wheels || pip install mlc-ai-nightly-cpu -f https://mlc.ai/wheels",
-        # Debug: show what was installed
-        "pip list | grep -i mlc && pip list | grep -i tvm && python -c 'import tvm; print(tvm.__version__)' || echo 'TVM import failed, checking alternatives...' && python -c 'import sys; [print(p) for p in sys.path]'",
+        # Install Apache TVM from pip (stable release with WebGPU support)
+        "pip install apache-tvm",
+        # Verify TVM installed correctly
+        "python -c 'import tvm; print(\"TVM version:\", tvm.__version__)'",
         # Install Emscripten
         "git clone https://github.com/emscripten-core/emsdk.git /opt/emsdk",
         "cd /opt/emsdk && ./emsdk install latest && ./emsdk activate latest",
@@ -109,12 +109,7 @@ def compile_sana_to_wasm():
     print("Step 2: Tracing model components with TorchDynamo → TVM")
     print("=" * 60)
 
-    try:
-        import tvm
-    except ModuleNotFoundError:
-        # MLC AI nightly packages tvm under mlc_ai
-        import mlc_ai as _mlc  # noqa: F401 — registers tvm into sys.modules
-        import tvm
+    import tvm
     from tvm import relax
     from tvm.relax.frontend.torch import from_fx
 
