@@ -215,8 +215,8 @@
           await ensurePipeline(res);
 
           // Generate
+          console.log("Pipeline loaded, starting generation...");
           const imageData = await sanaPipeline.generate(prompt, {
-            negativePrompt: negPrompt,
             steps: steps,
             onProgress: function(msg, step, total) {
               setStatus(msg);
@@ -231,8 +231,9 @@
           setProgress(100);
 
         } catch (e) {
-          setStatus("Generation failed: " + e.message);
-          console.error(e);
+          const msg = e ? (e.message || e.toString()) : "Unknown error";
+          setStatus("Generation failed: " + msg);
+          console.error("Full error:", e);
         } finally {
           generateBtn.disabled = false;
           generateBtn.textContent = "Generate";
