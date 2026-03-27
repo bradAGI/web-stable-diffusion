@@ -55,7 +55,7 @@ compiler_image = (
     })
 )
 
-SANA_MODEL_ID = "Efficient-Large-Model/Sana_600M_1024px"
+SANA_MODEL_ID = "Efficient-Large-Model/Sana_600M_1024px_diffusers"
 OUTPUT_DIR = "/artifacts"
 
 # Compile variants for different GPU capabilities
