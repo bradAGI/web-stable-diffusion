@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Image Gen — Browser AI</title>
+    <style>
+      * { box-sizing: border-box; margin: 0; padding: 0; }
+      body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0a0a0a; color: #e0e0e0; min-height: 100vh; display: flex; flex-direction: column; align-items: center; }
+      h1 { font-size: 1.5rem; margin: 2rem 0 0.25rem; }
+      .subtitle { color: #888; font-size: 0.85rem; margin-bottom: 1.5rem; }
+      .container { width: 100%; max-width: 640px; padding: 0 1rem; }
+      .input-group { display: flex; flex-direction: column; gap: 0.5rem; margin-bottom: 1rem; }
+      .row { display: flex; gap: 1rem; }
+      .row .input-group { flex: 1; }
+      label { font-size: 0.8rem; color: #aaa; }
+      textarea, select { background: #1a1a1a; border: 1px solid #333; border-radius: 8px; padding: 0.75rem; color: #fff; font-size: 0.9rem; resize: none; outline: none; }
+      textarea:focus, select:focus { border-color: #666; }
+      button { background: #fff; color: #000; border: none; border-radius: 8px; padding: 0.75rem 1.5rem; font-size: 0.9rem; font-weight: 600; cursor: pointer; transition: opacity 0.2s; }
+      button:hover { opacity: 0.85; }
+      button:disabled { opacity: 0.4; cursor: not-allowed; }
+      .canvas-wrap { margin: 1rem 0 2rem; display: flex; justify-content: center; }
+      canvas, img { border-radius: 8px; border: 1px solid #222; background: #111; max-width: 100%; }
+      #status { font-size: 0.8rem; color: #888; margin-bottom: 0.5rem; min-height: 1.2em; }
+      .progress-wrap { width: 100%; margin-bottom: 1rem; }
+      progress { width: 100%; height: 6px; appearance: none; border: none; border-radius: 3px; overflow: hidden; }
+      progress::-webkit-progress-bar { background: #222; border-radius: 3px; }
+      progress::-webkit-progress-value { background: #fff; border-radius: 3px; }
+      #gpu-status { font-size: 0.75rem; color: #666; margin-bottom: 1rem; }
+      .model-info { font-size: 0.7rem; color: #555; margin-top: 0.25rem; }
+      #output-img { display: none; width: 512px; height: 512px; }
+    </style>
+  </head>
+  <body>
+    <h1>Browser Image Generation</h1>
+    <p class="subtitle">Runs entirely in your browser via WebGPU. No server needed.</p>
+
+    <div class="container">
+      <div id="gpu-status">Detecting GPU...</div>
+      <div id="status"></div>
+      <div class="progress-wrap">
+        <progress id="progress" value="0" max="100"></progress>
+      </div>
+
+      <div class="input-group">
+        <label for="prompt">Prompt</label>
+        <textarea id="prompt" rows="3" placeholder="A photo of an astronaut riding a horse on mars">A photo of an astronaut riding a horse on mars</textarea>
+      </div>
+
+      <div class="row">
+        <div class="input-group" style="max-width: 180px;">
+          <label for="model">Model</label>
+          <select id="model">
+            <option value="sd-turbo" selected>SD-Turbo (fast, 250 MB)</option>
+          </select>
+          <div class="model-info">512×512 · 1 step · ~2-5s</div>
+        </div>
+        <div class="input-group" style="max-width: 120px;">
+          <label for="seed">Seed</label>
+          <select id="seed">
+            <option value="random" selected>Random</option>
+            <option value="42">42</option>
+            <option value="123">123</option>
+            <option value="7777">7777</option>
+          </select>
+        </div>
+      </div>
+
+      <div style="margin-bottom: 1rem;">
+        <button id="generate-btn" disabled>Detecting GPU...</button>
+      </div>
+
+      <div class="canvas-wrap">
+        <img id="output-img" alt="Generated image" />
+      </div>
+    </div>
+
+    <script type="module">
+      // Import web-txt2img from CDN
+      import { Txt2ImgWorkerClient } from 'https://esm.sh/web-txt2img@0.3.1';
+
+      const statusEl = document.getElementById("status");
+      const progressEl = document.getElementById("progress");
+      const gpuStatusEl = document.getElementById("gpu-status");
+      const generateBtn = document.getElementById("generate-btn");
+      const promptEl = document.getElementById("prompt");
+      const modelSelect = document.getElementById("model");
+      const seedSelect = document.getElementById("seed");
+      const outputImg = document.getElementById("output-img");
+
+      function setStatus(msg) { statusEl.textContent = msg; }
+      function setProgress(val) { progressEl.value = val; }
+
+      let client = null;
+      let modelLoaded = false;
+
+      // Detect GPU
+      async function detectGPU() {
+        if (!navigator.gpu) {
+          gpuStatusEl.textContent = "WebGPU not supported. Try Chrome or Edge.";
+          gpuStatusEl.style.color = "#e55";
+          return false;
+        }
+        try {
+          const adapter = await navigator.gpu.requestAdapter();
+          if (!adapter) {
+            gpuStatusEl.textContent = "No WebGPU adapter found.";
+            gpuStatusEl.style.color = "#e55";
+            return false;
+          }
+          const info = adapter.info || {};
+          const desc = info.description || info.vendor || "Unknown GPU";
+          const vram = (adapter.limits.maxBufferSize / (1024**3)).toFixed(1);
+          gpuStatusEl.textContent = "GPU: " + desc + " (~" + vram + " GB)";
+          return true;
+        } catch (e) {
+          gpuStatusEl.textContent = "GPU detection failed: " + e.message;
+          return false;
+        }
+      }
+
+      // Initialize
+      async function init() {
+        const hasGPU = await detectGPU();
+        if (!hasGPU) {
+          setStatus("WebGPU required for browser image generation.");
+          return;
+        }
+
+        setStatus("Ready! Enter a prompt and click Generate.");
+        generateBtn.textContent = "Generate";
+        generateBtn.disabled = false;
+      }
+
+      async function ensureModel() {
+        if (client && modelLoaded) return;
+
+        setStatus("Loading SD-Turbo model (250 MB, cached after first use)...");
+        setProgress(10);
+        generateBtn.disabled = true;
+        generateBtn.textContent = "Loading model...";
+
+        client = Txt2ImgWorkerClient.createDefault();
+
+        await client.load("sd-turbo", {
+          backendPreference: ["webgpu"],
+          progressCallback: (info) => {
+            if (info.phase) setStatus("Loading: " + info.phase);
+            if (info.progress != null) setProgress(info.progress * 100);
+          },
+        });
+
+        modelLoaded = true;
+        setStatus("Model loaded! Generating...");
+        setProgress(50);
+      }
+
+      generateBtn.addEventListener("click", async () => {
+        const prompt = promptEl.value.trim();
+        if (!prompt) { setStatus("Please enter a prompt."); return; }
+
+        generateBtn.disabled = true;
+        generateBtn.textContent = "Generating...";
+        setProgress(0);
+        outputImg.style.display = "none";
+
+        try {
+          await ensureModel();
+
+          const seedVal = seedSelect.value === "random" ? Math.floor(Math.random() * 100000) : parseInt(seedSelect.value);
+
+          setStatus("Generating image (seed: " + seedVal + ")...");
+          setProgress(60);
+
+          const { promise } = client.generate({
+            prompt: prompt,
+            seed: seedVal,
+            width: 512,
+            height: 512,
+          });
+
+          const result = await promise;
+
+          if (result.ok) {
+            const url = URL.createObjectURL(result.blob);
+            outputImg.src = url;
+            outputImg.style.display = "block";
+            setStatus("Done! 512×512 image generated.");
+            setProgress(100);
+          } else {
+            setStatus("Generation failed: " + (result.error || "unknown error"));
+          }
+        } catch (e) {
+          setStatus("Error: " + (e.message || e));
+          console.error("Generation error:", e);
+        } finally {
+          generateBtn.disabled = false;
+          generateBtn.textContent = "Generate";
+        }
+      });
+
+      init();
+    </script>
+  </body>
+</html>
