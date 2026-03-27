@@ -136,6 +136,32 @@ def compile_sana_to_wasm():
     os.environ["EMSDK"] = "/opt/emsdk"
     subprocess.run(["bash", "-c", "source /opt/emsdk/emsdk_env.sh"], check=True, capture_output=True)
 
+    # Wrap VAE decoder as a proper nn.Module for tracing
+    class VAEDecodeWrapper(torch.nn.Module):
+        def __init__(self, vae_model):
+            super().__init__()
+            self.vae = vae_model
+
+        def forward(self, latent):
+            return self.vae.decode(latent).sample
+
+    # Wrap transformer for tracing (disable control flow)
+    class TransformerWrapper(torch.nn.Module):
+        def __init__(self, dit_model):
+            super().__init__()
+            self.dit = dit_model
+
+        def forward(self, hidden_states, encoder_hidden_states, timestep):
+            return self.dit(
+                hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+                timestep=timestep,
+                return_dict=False,
+            )[0]
+
+    vae_wrapper = VAEDecodeWrapper(vae).cuda().half().eval()
+    dit_wrapper = TransformerWrapper(transformer).cuda().half().eval()
+
     for variant in RESOLUTION_VARIANTS:
         res_name = variant["name"]
         latent_h = latent_w = variant["latent_size"]
@@ -152,52 +178,84 @@ def compile_sana_to_wasm():
         dummy_latent = torch.randn(1, latent_channels, latent_h, latent_w, dtype=torch.float16, device="cuda")
         vae_mod = None
         try:
-            from torch.export import export
-            from tvm.relax.frontend.torch import from_exported_program
+            # Use torch.jit.trace which handles control flow better
             with torch.no_grad():
-                exported_vae = export(vae.decode, (dummy_latent,))
-            vae_mod = from_exported_program(exported_vae, keep_params_as_input=True)
+                traced_vae = torch.jit.trace(vae_wrapper, (dummy_latent,))
+            # Convert JIT to TVM via from_fx (JIT → FX → TVM)
+            from tvm.relax.frontend.torch import from_fx
+            import torch.fx
+            fx_vae = torch.fx.symbolic_trace(traced_vae)
+            vae_mod = from_fx(fx_vae, [(1, latent_channels, latent_h, latent_w)], keep_params_as_input=True)
             print(f"  ✓ DC-AE decoder traced for {res_name}")
         except Exception as e:
-            print(f"  torch.export failed ({e}), trying FX...")
+            print(f"  JIT+FX trace failed ({e}), trying torch.export...")
             try:
-                import torch.fx
+                from torch.export import export
+                from tvm.relax.frontend.torch import from_exported_program
                 with torch.no_grad():
-                    traced_vae = torch.fx.symbolic_trace(vae.decode)
-                vae_mod = from_fx(traced_vae, [(1, latent_channels, latent_h, latent_w)], keep_params_as_input=True)
-                print(f"  ✓ DC-AE decoder traced via FX for {res_name}")
+                    exported_vae = export(vae_wrapper, (dummy_latent,))
+                vae_mod = from_exported_program(exported_vae, keep_params_as_input=True)
+                print(f"  ✓ DC-AE decoder traced via torch.export for {res_name}")
             except Exception as e2:
                 print(f"  ✗ VAE trace failed for {res_name}: {e2}")
+                # Save ONNX as fallback
+                try:
+                    onnx_path = f"{variant_dir}/sana_vae_{res_name}.onnx"
+                    torch.onnx.export(
+                        vae_wrapper, (dummy_latent,), onnx_path,
+                        input_names=["latent"], output_names=["image"],
+                        dynamic_axes=None, opset_version=17,
+                    )
+                    print(f"  ✓ VAE exported to ONNX: {onnx_path}")
+                except Exception as e3:
+                    print(f"  ✗ ONNX export also failed: {e3}")
 
         # --- Trace Transformer ---
         print(f"  Tracing Linear DiT for {res_name}...")
         dummy_hidden = torch.randn(1, latent_channels, latent_h, latent_w, dtype=torch.float16, device="cuda")
-        dummy_encoder_hidden = torch.randn(1, 300, transformer.config.cross_attention_dim, dtype=torch.float16, device="cuda")
+        # Get the correct text encoder hidden size from the model config
+        cross_attn_dim = transformer.config.cross_attention_dim
+        max_seq_len = 300  # Sana uses max 300 text tokens
+        dummy_encoder_hidden = torch.randn(1, max_seq_len, cross_attn_dim, dtype=torch.float16, device="cuda")
         dummy_timestep = torch.tensor([500.0], dtype=torch.float16, device="cuda")
         dit_mod = None
         try:
-            from torch.export import export
-            from tvm.relax.frontend.torch import from_exported_program
             with torch.no_grad():
-                exported_dit = export(transformer, (dummy_hidden, dummy_encoder_hidden, dummy_timestep))
-            dit_mod = from_exported_program(exported_dit, keep_params_as_input=True)
+                traced_dit = torch.jit.trace(dit_wrapper, (dummy_hidden, dummy_encoder_hidden, dummy_timestep))
+            from tvm.relax.frontend.torch import from_fx
+            import torch.fx
+            fx_dit = torch.fx.symbolic_trace(traced_dit)
+            dit_mod = from_fx(
+                fx_dit,
+                [(1, latent_channels, latent_h, latent_w), (1, max_seq_len, cross_attn_dim), (1,)],
+                keep_params_as_input=True,
+            )
             print(f"  ✓ Transformer traced for {res_name}")
         except Exception as e:
-            print(f"  torch.export failed ({e}), trying FX...")
+            print(f"  JIT+FX trace failed ({e}), trying torch.export...")
             try:
-                import torch.fx
+                from torch.export import export
+                from tvm.relax.frontend.torch import from_exported_program
                 with torch.no_grad():
-                    traced_dit = torch.fx.symbolic_trace(transformer)
-                dit_mod = from_fx(
-                    traced_dit,
-                    [(1, latent_channels, latent_h, latent_w), (1, 300, transformer.config.cross_attention_dim), (1,)],
-                    keep_params_as_input=True,
-                )
-                print(f"  ✓ Transformer traced via FX for {res_name}")
+                    exported_dit = export(dit_wrapper, (dummy_hidden, dummy_encoder_hidden, dummy_timestep))
+                dit_mod = from_exported_program(exported_dit, keep_params_as_input=True)
+                print(f"  ✓ Transformer traced via torch.export for {res_name}")
             except Exception as e2:
                 print(f"  ✗ Transformer trace failed for {res_name}: {e2}")
+                # Save ONNX as fallback
+                try:
+                    onnx_path = f"{variant_dir}/sana_dit_{res_name}.onnx"
+                    torch.onnx.export(
+                        dit_wrapper, (dummy_hidden, dummy_encoder_hidden, dummy_timestep), onnx_path,
+                        input_names=["hidden_states", "encoder_hidden_states", "timestep"],
+                        output_names=["output"],
+                        dynamic_axes=None, opset_version=17,
+                    )
+                    print(f"  ✓ Transformer exported to ONNX: {onnx_path}")
+                except Exception as e3:
+                    print(f"  ✗ ONNX export also failed: {e3}")
 
-        # --- Compile each module ---
+        # --- Compile each TVM module ---
         for comp_name, mod in [("vae", vae_mod), ("dit", dit_mod)]:
             if mod is None:
                 continue
