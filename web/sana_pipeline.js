@@ -10,7 +10,7 @@
 const MODEL_BASE_URL = "https://huggingface.co/brad-agi/sana-0.6b-onnx-webgpu/resolve/main";
 const CLIP_BASE_URL = "https://huggingface.co/onnx-community/clip-vit-large-patch14-ONNX/resolve/main";
 
-const CLIP_MODEL_FILE = "onnx/model_q4f16.onnx"; // 298 MB quantized CLIP
+const CLIP_MODEL_FILE = "onnx/model_fp16.onnx"; // 856 MB fp16 CLIP — best WebGPU compatibility
 const CLIP_TOKENIZER_FILE = "tokenizer.json";
 
 const VARIANT_CONFIG = {
@@ -40,7 +40,16 @@ class SanaPipeline {
       else throw new Error("onnxruntime-web not loaded.");
     }
 
-    const sessionOpts = { executionProviders: ["webgpu"], graphOptimizationLevel: "all" };
+    // Try WebGPU first, fall back to WASM if needed
+    let useWebGPU = true;
+    try {
+      const adapter = await navigator.gpu?.requestAdapter();
+      if (!adapter) useWebGPU = false;
+    } catch { useWebGPU = false; }
+
+    const ep = useWebGPU ? "webgpu" : "wasm";
+    console.log("Using execution provider:", ep);
+    const sessionOpts = { executionProviders: [ep], graphOptimizationLevel: "all" };
     const totalSteps = 4;
     let step = 0;
 
