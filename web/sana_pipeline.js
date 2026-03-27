@@ -151,14 +151,28 @@ class SanaPipeline {
       try {
         const output = await this.ditSession.run(feeds);
         const noisePred = Object.values(output)[0];
-        const data = noisePred.cpuData || noisePred.data;
-        const dt = 1.0 / steps;
 
-        if (data.constructor === Uint16Array) {
-          const f32 = this._f16ToF32(data);
+        // WebGPU tensors need getData() to transfer from GPU → CPU
+        let rawData;
+        if (typeof noisePred.getData === "function") {
+          rawData = await noisePred.getData();
+        } else {
+          rawData = noisePred.cpuData || noisePred.data;
+        }
+
+        if (step === 0) {
+          console.log("DiT output type:", rawData.constructor.name, "length:", rawData.length, "expected:", currentLatent.length);
+          // Sample some values
+          const sample = rawData.constructor === Uint16Array ? this._f16ToF32(rawData.slice(0, 5)) : Array.from(rawData.slice(0, 5));
+          console.log("DiT output sample:", sample);
+        }
+
+        const dt = 1.0 / steps;
+        if (rawData.constructor === Uint16Array) {
+          const f32 = this._f16ToF32(rawData);
           for (let i = 0; i < currentLatent.length; i++) currentLatent[i] -= f32[i] * dt;
         } else {
-          for (let i = 0; i < currentLatent.length; i++) currentLatent[i] -= data[i] * dt;
+          for (let i = 0; i < rawData.length && i < currentLatent.length; i++) currentLatent[i] -= rawData[i] * dt;
         }
       } catch (e) {
         console.error(`DiT step ${step} failed:`, e);
@@ -183,7 +197,12 @@ class SanaPipeline {
     try {
       const output = await this.vaeSession.run(vaeFeed);
       const imgTensor = Object.values(output)[0];
-      const rawData = imgTensor.cpuData || imgTensor.data;
+      let rawData;
+      if (typeof imgTensor.getData === "function") {
+        rawData = await imgTensor.getData();
+      } else {
+        rawData = imgTensor.cpuData || imgTensor.data;
+      }
 
       // Debug: check output range
       const f32 = rawData instanceof Float32Array ? rawData : (rawData.constructor === Uint16Array ? this._f16ToF32(rawData) : new Float32Array(rawData));
