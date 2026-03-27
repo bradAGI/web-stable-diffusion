@@ -4,15 +4,63 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Web Stable Diffusion</title>
-    <link rel="stylesheet" href="app.css" />
+    <style>
+      * { box-sizing: border-box; margin: 0; padding: 0; }
+      body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0a0a0a; color: #e0e0e0; min-height: 100vh; display: flex; flex-direction: column; align-items: center; }
+      h1 { font-size: 1.5rem; margin: 2rem 0 0.5rem; }
+      .subtitle { color: #888; font-size: 0.85rem; margin-bottom: 1.5rem; }
+      .container { width: 100%; max-width: 640px; padding: 0 1rem; }
+      .input-group { display: flex; flex-direction: column; gap: 0.5rem; margin-bottom: 1rem; }
+      label { font-size: 0.8rem; color: #aaa; }
+      textarea, input[type="text"] { background: #1a1a1a; border: 1px solid #333; border-radius: 8px; padding: 0.75rem; color: #fff; font-size: 0.9rem; resize: none; outline: none; }
+      textarea:focus, input:focus { border-color: #666; }
+      button { background: #fff; color: #000; border: none; border-radius: 8px; padding: 0.75rem 1.5rem; font-size: 0.9rem; font-weight: 600; cursor: pointer; transition: opacity 0.2s; }
+      button:hover { opacity: 0.85; }
+      button:disabled { opacity: 0.4; cursor: not-allowed; }
+      .canvas-wrap { margin: 1.5rem 0; display: flex; justify-content: center; }
+      canvas { border-radius: 8px; border: 1px solid #222; background: #111; }
+      #status { font-size: 0.8rem; color: #888; margin-bottom: 0.5rem; min-height: 1.2em; }
+      .progress-wrap { width: 100%; margin-bottom: 1rem; }
+      progress { width: 100%; height: 6px; appearance: none; border: none; border-radius: 3px; overflow: hidden; }
+      progress::-webkit-progress-bar { background: #222; border-radius: 3px; }
+      progress::-webkit-progress-value { background: #fff; border-radius: 3px; }
+      #gpu-status { font-size: 0.75rem; color: #666; margin-bottom: 1rem; }
+    </style>
   </head>
   <body>
+    <h1>Web Stable Diffusion</h1>
+    <p class="subtitle">Runs entirely in your browser via WebGPU. No server needed.</p>
+
+    <div class="container">
+      <div id="gpu-status">Checking WebGPU support...</div>
+      <div id="status"></div>
+      <div class="progress-wrap">
+        <progress id="progress" value="0" max="100"></progress>
+      </div>
+
+      <div class="input-group">
+        <label for="prompt">Prompt</label>
+        <textarea id="prompt" rows="3" placeholder="A photo of an astronaut riding a horse on mars">A photo of an astronaut riding a horse on mars</textarea>
+      </div>
+      <div class="input-group">
+        <label for="neg-prompt">Negative prompt (optional)</label>
+        <input type="text" id="neg-prompt" placeholder="blurry, low quality" value="" />
+      </div>
+
+      <button id="generate-btn" disabled>Loading model...</button>
+
+      <div class="canvas-wrap">
+        <canvas id="canvas" width="512" height="512"></canvas>
+      </div>
+    </div>
+
+    <!-- TVM runtime -->
     <script>
       var tvmjsGlobalEnv = tvmjsGlobalEnv || {};
     </script>
-    <div id="root"></div>
-    <div id="modal-root"></div>
     <script src="https://websd.mlc.ai/dist/tvmjs.bundle.js"></script>
+
+    <!-- Tokenizer WASM -->
     <script type="module">
       import init, { TokenizerWasm } from "https://websd.mlc.ai/dist/tokenizers-wasm/tokenizers_wasm.js";
 
@@ -22,17 +70,116 @@
           await init();
           initialized = true;
         }
-        const response = await fetch(`https://huggingface.co/${name}/raw/main/tokenizer.json`);
+        const response = await fetch("https://huggingface.co/" + name + "/raw/main/tokenizer.json");
         const jsonText = await response.text();
         return new TokenizerWasm(jsonText);
       }
 
       tvmjsGlobalEnv.getTokenizer = getTokenizer;
+
+      // Signal that tokenizer is ready
+      window.__tokenizerReady = true;
+      window.dispatchEvent(new Event("tokenizer-ready"));
     </script>
-    <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
-    <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
-    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+    <!-- SD pipeline runtime -->
     <script src="stable_diffusion.js"></script>
-    <script type="text/babel" data-type="module" data-presets="env,react" src="app.jsx"></script>
+
+    <!-- App logic (no JSX, no Babel needed) -->
+    <script>
+      const statusEl = document.getElementById("status");
+      const progressEl = document.getElementById("progress");
+      const gpuStatusEl = document.getElementById("gpu-status");
+      const generateBtn = document.getElementById("generate-btn");
+      const promptEl = document.getElementById("prompt");
+      const negPromptEl = document.getElementById("neg-prompt");
+
+      function setStatus(msg) { statusEl.textContent = msg; }
+      function setProgress(val) { progressEl.value = val; }
+
+      // Hook into the SD runtime's UI callbacks
+      tvmjsGlobalEnv.logMessage = function(msg) {
+        console.log(msg);
+        setStatus(msg);
+      };
+      tvmjsGlobalEnv.updateProgress = function(report) {
+        setStatus(report.text);
+        setProgress(report.progress * 100);
+      };
+      tvmjsGlobalEnv.updateGpuStatus = function(msg) {
+        gpuStatusEl.textContent = msg;
+      };
+      tvmjsGlobalEnv.updateGenerateProgress = function(step, total) {
+        const pct = Math.round((step / total) * 100);
+        setProgress(pct);
+        setStatus("Generating... step " + step + "/" + total);
+      };
+
+      let sdInstance = null;
+
+      async function initSD() {
+        // Wait for tokenizer to be ready
+        if (!window.__tokenizerReady) {
+          await new Promise(resolve => {
+            window.addEventListener("tokenizer-ready", resolve, { once: true });
+          });
+        }
+
+        setStatus("Initializing Stable Diffusion...");
+        generateBtn.textContent = "Loading model...";
+
+        sdInstance = new StableDiffusionInstance();
+
+        try {
+          await sdInstance.init();
+          setStatus("Ready! Enter a prompt and click Generate.");
+          generateBtn.textContent = "Generate";
+          generateBtn.disabled = false;
+        } catch (err) {
+          setStatus("Failed to initialize: " + err.message);
+          gpuStatusEl.textContent = "Error: " + err.message;
+          console.error(err);
+        }
+      }
+
+      generateBtn.addEventListener("click", async function() {
+        if (!sdInstance) return;
+
+        const prompt = promptEl.value.trim();
+        if (!prompt) {
+          setStatus("Please enter a prompt.");
+          return;
+        }
+        const negPrompt = negPromptEl.value.trim();
+
+        generateBtn.disabled = true;
+        generateBtn.textContent = "Generating...";
+        setProgress(0);
+        setStatus("Starting generation...");
+
+        try {
+          await sdInstance.generate(
+            prompt,
+            negPrompt,
+            function(stage, step, total, totalSteps) {
+              const pct = Math.round(((step + 1) / totalSteps) * 100);
+              setProgress(pct);
+              setStatus(stage + " - step " + (step + 1) + "/" + totalSteps);
+            }
+          );
+          setStatus("Done!");
+          setProgress(100);
+        } catch (err) {
+          setStatus("Generation failed: " + err.message);
+          console.error(err);
+        } finally {
+          generateBtn.disabled = false;
+          generateBtn.textContent = "Generate";
+        }
+      });
+
+      // Start initialization
+      initSD();
+    </script>
   </body>
 </html>
