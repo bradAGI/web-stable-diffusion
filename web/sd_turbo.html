@@ -78,7 +78,10 @@
     <script type="module">
       // Import dependencies
       import * as ort from './node_modules/onnxruntime-web/dist/ort.all.mjs';
-      import { AutoTokenizer } from './node_modules/@xenova/transformers/dist/transformers.min.js';
+      import { AutoTokenizer, env } from './node_modules/@xenova/transformers/dist/transformers.min.js';
+      // Configure transformers.js to load from HuggingFace, not local
+      env.allowLocalModels = false;
+      env.useBrowserCache = true;
       // Import web-txt2img direct API
       import { loadModel, generateImage, isModelLoaded } from './node_modules/web-txt2img/dist/index.js';
 
