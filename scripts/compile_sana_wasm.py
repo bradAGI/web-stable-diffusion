@@ -316,14 +316,44 @@ def compile_sana_to_wasm():
                 print(f"  ✗ Transformer trace failed for {res_name}: {e2}")
                 # Save ONNX as fallback
                 try:
+                    fp32_onnx_path = f"{variant_dir}/sana_dit_{res_name}_fp32.onnx"
                     onnx_path = f"{variant_dir}/sana_dit_{res_name}.onnx"
                     torch.onnx.export(
-                        dit_wrapper, (dummy_hidden, dummy_encoder_hidden, dummy_timestep), onnx_path,
+                        dit_wrapper, (dummy_hidden, dummy_encoder_hidden, dummy_timestep), fp32_onnx_path,
                         input_names=["hidden_states", "encoder_hidden_states", "timestep"],
                         output_names=["output"],
                         dynamic_axes=None, opset_version=18,
                     )
-                    print(f"  ✓ Transformer exported to ONNX: {onnx_path}")
+                    print(f"  ✓ Transformer exported as float32 ONNX")
+
+                    # Convert to mixed-precision fp16 (keeps LayerNorm/Softmax in fp32)
+                    try:
+                        from onnxruntime.transformers.float16 import convert_float_to_float16
+                        import onnx
+                        print(f"  Converting to mixed-precision fp16...")
+                        model = onnx.load(fp32_onnx_path)
+                        model_fp16 = convert_float_to_float16(
+                            model,
+                            keep_io_types=False,
+                            op_block_list=["LayerNormalization", "Softmax", "ReduceMean"],
+                        )
+                        onnx.save(model_fp16, onnx_path)
+                        # Clean up fp32 version
+                        for f in [fp32_onnx_path, fp32_onnx_path + ".data"]:
+                            if os.path.exists(f):
+                                os.remove(f)
+                        onnx_size = os.path.getsize(onnx_path) / 1e6
+                        data_file = onnx_path + ".data"
+                        if os.path.exists(data_file):
+                            onnx_size += os.path.getsize(data_file) / 1e6
+                        print(f"  ✓ Mixed-precision fp16 DiT: {onnx_size:.0f} MB")
+                    except Exception as conv_err:
+                        print(f"  ⚠ fp16 conversion failed ({conv_err}), keeping fp32")
+                        import shutil
+                        shutil.move(fp32_onnx_path, onnx_path)
+                        for f in [fp32_onnx_path + ".data"]:
+                            if os.path.exists(f):
+                                shutil.move(f, onnx_path + ".data")
                 except Exception as e3:
                     print(f"  ✗ ONNX export also failed: {e3}")
 
