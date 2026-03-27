@@ -740,11 +740,13 @@ def export_dit_float32_only():
 
         onnx_path = f"{variant_dir}/sana_dit_{res_name}.onnx"
         with torch.no_grad():
+            # Use legacy TorchScript exporter — dynamo exporter produces NaN for Sana's attention
             torch.onnx.export(
                 dit_wrapper, (dummy_h, dummy_e, dummy_t), onnx_path,
                 input_names=["hidden_states", "encoder_hidden_states", "timestep"],
                 output_names=["output"],
-                dynamic_axes=None, opset_version=18,
+                opset_version=14,
+                dynamo=False,
             )
         size = os.path.getsize(onnx_path) / 1e6
         data_file = onnx_path + ".data"
