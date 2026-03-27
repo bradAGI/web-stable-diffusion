@@ -216,7 +216,7 @@ def compile_sana_to_wasm():
             )[0]
 
     vae_wrapper = VAEDecodeWrapper(vae).cuda().eval()  # float32 for VAE
-    dit_wrapper = TransformerWrapper(transformer).cuda().half().eval()
+    dit_wrapper = TransformerWrapper(transformer).cuda().float().eval()  # float32 to avoid fp16 NaN in attention
 
     # Get the correct text encoder hidden size from model config
     # Sana uses Gemma text encoder — caption_projection expects its hidden dim
@@ -285,11 +285,11 @@ def compile_sana_to_wasm():
 
         # --- Trace Transformer ---
         print(f"  Tracing Linear DiT for {res_name}...")
-        dummy_hidden = torch.randn(1, latent_channels, latent_h, latent_w, dtype=torch.float16, device="cuda")
+        dummy_hidden = torch.randn(1, latent_channels, latent_h, latent_w, dtype=torch.float32, device="cuda")
         # caption_projection.linear_1 expects (batch, seq, caption_channels)
         max_seq_len = 300  # Sana uses max 300 text tokens
-        dummy_encoder_hidden = torch.randn(1, max_seq_len, text_hidden_size, dtype=torch.float16, device="cuda")
-        dummy_timestep = torch.tensor([500.0], dtype=torch.float16, device="cuda")
+        dummy_encoder_hidden = torch.randn(1, max_seq_len, text_hidden_size, dtype=torch.float32, device="cuda")
+        dummy_timestep = torch.tensor([500.0], dtype=torch.float32, device="cuda")
         dit_mod = None
         try:
             with torch.no_grad():
@@ -691,7 +691,8 @@ def export_text_encoder_quantized():
 
 @app.local_entrypoint()
 def main():
-    print("Exporting quantized Gemma text encoder (int4/int8)...")
-    export_text_encoder_quantized.remote()
+    # Re-export DiT in float32 to fix NaN issue
+    print("Re-exporting all models (DiT in float32)...")
+    compile_sana_to_wasm.remote()
     print("\nDone! Download with:")
     print("  modal volume get sana-wasm-artifacts /artifacts/sana-wasm ./sana-wasm")
