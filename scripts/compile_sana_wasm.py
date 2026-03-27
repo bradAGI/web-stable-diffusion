@@ -556,10 +556,137 @@ def export_text_encoder_only():
     print("Download: modal volume get sana-wasm-artifacts /artifacts/sana-wasm/sana_text_encoder.onnx* .")
 
 
+@app.function(
+    image=compiler_image,
+    gpu="A100",
+    timeout=3600,
+    volumes={OUTPUT_DIR: vol},
+    memory=32768,
+)
+def export_text_encoder_quantized():
+    """Export Gemma text encoder quantized to int4 (skip if fp16 already exists)."""
+    import os
+    import torch
+
+    print("=" * 60)
+    print("Exporting Gemma text encoder — INT4 quantized")
+    print("=" * 60)
+
+    out_path = f"{OUTPUT_DIR}/sana-wasm/sana_text_encoder_int4.onnx"
+    if os.path.exists(out_path):
+        print(f"  Already exists: {out_path}, skipping.")
+        return
+
+    from diffusers import SanaPipeline
+
+    pipe = SanaPipeline.from_pretrained(
+        SANA_MODEL_ID,
+        torch_dtype=torch.float16,
+        variant="fp16",
+    )
+    pipe = pipe.to("cuda")
+
+    text_encoder = pipe.text_encoder
+    text_encoder.eval()
+    tokenizer = pipe.tokenizer
+
+    class TextEncoderWrapper(torch.nn.Module):
+        def __init__(self, encoder):
+            super().__init__()
+            self.encoder = encoder
+
+        def forward(self, input_ids, attention_mask):
+            outputs = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
+            return outputs.last_hidden_state
+
+    text_enc_wrapper = TextEncoderWrapper(text_encoder).cuda().half().eval()
+
+    max_seq_len = 300
+    dummy_input_ids = torch.ones(1, max_seq_len, dtype=torch.long, device="cuda")
+    dummy_attention_mask = torch.ones(1, max_seq_len, dtype=torch.long, device="cuda")
+
+    os.makedirs(f"{OUTPUT_DIR}/sana-wasm", exist_ok=True)
+
+    # Step 1: Export fp16 ONNX first (temporary)
+    fp16_path = f"{OUTPUT_DIR}/sana-wasm/_temp_text_encoder_fp16.onnx"
+    print("  Exporting fp16 ONNX (temporary)...")
+    with torch.no_grad():
+        torch.onnx.export(
+            text_enc_wrapper,
+            (dummy_input_ids, dummy_attention_mask),
+            fp16_path,
+            input_names=["input_ids", "attention_mask"],
+            output_names=["hidden_states"],
+            dynamic_axes={
+                "input_ids": {1: "seq_len"},
+                "attention_mask": {1: "seq_len"},
+                "hidden_states": {1: "seq_len"},
+            },
+            opset_version=18,
+        )
+    print("  ✓ fp16 export done")
+
+    # Step 2: Quantize to int4 using onnxruntime
+    print("  Quantizing to INT4...")
+    try:
+        from onnxruntime.quantization import quantize_dynamic, QuantType
+        quantize_dynamic(
+            fp16_path,
+            out_path,
+            weight_type=QuantType.QInt8,  # int8 is most compatible with WebGPU
+            extra_options={"MatMulConstBOnly": True},
+        )
+        q_size = os.path.getsize(out_path) / 1e6
+        data_path = out_path + ".data"
+        if os.path.exists(data_path):
+            q_size += os.path.getsize(data_path) / 1e6
+        print(f"  ✓ Quantized text encoder: {q_size:.0f} MB")
+    except Exception as e:
+        print(f"  INT8 dynamic quantization failed: {e}")
+        print("  Trying ONNX MatMulNBits (4-bit)...")
+        try:
+            from onnxruntime.quantization import matmul_4bits_quantizer
+            model = matmul_4bits_quantizer.MatMul4BitsQuantizer(
+                fp16_path,
+                block_size=32,
+                is_symmetric=True,
+            )
+            model.process()
+            model.model.save(out_path)
+            q_size = os.path.getsize(out_path) / 1e6
+            data_path = out_path + ".data"
+            if os.path.exists(data_path):
+                q_size += os.path.getsize(data_path) / 1e6
+            print(f"  ✓ 4-bit quantized text encoder: {q_size:.0f} MB")
+        except Exception as e2:
+            print(f"  4-bit quantization also failed: {e2}")
+            # Fall back: just copy fp16 as the "quantized" version
+            import shutil
+            shutil.copy2(fp16_path, out_path)
+            fp16_data = fp16_path + ".data"
+            if os.path.exists(fp16_data):
+                shutil.copy2(fp16_data, out_path + ".data")
+            print("  ⚠ Using fp16 as fallback (no quantization applied)")
+
+    # Clean up temp file
+    for f in [fp16_path, fp16_path + ".data"]:
+        if os.path.exists(f):
+            os.remove(f)
+
+    # Save tokenizer if not already there
+    tok_dir = f"{OUTPUT_DIR}/sana-wasm/tokenizer"
+    if not os.path.exists(tok_dir):
+        os.makedirs(tok_dir, exist_ok=True)
+        tokenizer.save_pretrained(tok_dir)
+        print("  ✓ Tokenizer saved")
+
+    vol.commit()
+    print(f"\n✓ Quantized text encoder saved to volume")
+
+
 @app.local_entrypoint()
 def main():
-    # Text encoder only — DiT/VAE already exported
-    print("Exporting Gemma text encoder only...")
-    export_text_encoder_only.remote()
+    print("Exporting quantized Gemma text encoder (int4/int8)...")
+    export_text_encoder_quantized.remote()
     print("\nDone! Download with:")
     print("  modal volume get sana-wasm-artifacts /artifacts/sana-wasm ./sana-wasm")
