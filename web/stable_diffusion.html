@@ -57,6 +57,21 @@
     <!-- TVM runtime -->
     <script>
       var tvmjsGlobalEnv = tvmjsGlobalEnv || {};
+
+      // Polyfill: modern Chrome removed adapter.requestAdapterInfo() in favor of adapter.info
+      // The MLC CDN tvmjs.bundle.js calls the old API, so we shim it.
+      if (typeof navigator !== "undefined" && navigator.gpu) {
+        const origRequestAdapter = navigator.gpu.requestAdapter.bind(navigator.gpu);
+        navigator.gpu.requestAdapter = async function(options) {
+          const adapter = await origRequestAdapter(options);
+          if (adapter && !adapter.requestAdapterInfo) {
+            adapter.requestAdapterInfo = async function() {
+              return adapter.info || { vendor: "unknown", architecture: "", device: "", description: "" };
+            };
+          }
+          return adapter;
+        };
+      }
     </script>
     <script src="https://websd.mlc.ai/dist/tvmjs_runtime.wasi.js"></script>
     <script src="https://websd.mlc.ai/dist/tvmjs.bundle.js"></script>
