@@ -182,42 +182,53 @@ def compile_sana_to_wasm():
         variant_dir = f"{OUTPUT_DIR}/sana-wasm/{res_name}"
         os.makedirs(variant_dir, exist_ok=True)
 
-        # --- Trace DC-AE decoder ---
-        print(f"  Tracing DC-AE decoder for {res_name}...")
+        # --- Export DC-AE decoder to ONNX ---
+        print(f"  Exporting DC-AE decoder for {res_name}...")
         dummy_latent = torch.randn(1, latent_channels, latent_h, latent_w, dtype=torch.float32, device="cuda")
         vae_mod = None
+        onnx_vae_path = f"{variant_dir}/sana_vae_{res_name}.onnx"
         try:
-            # Use torch.jit.trace which handles control flow better
+            # ONNX export directly — most reliable for complex models
             with torch.no_grad():
-                traced_vae = torch.jit.trace(vae_wrapper, (dummy_latent,))
-            # Convert JIT to TVM via from_fx (JIT → FX → TVM)
-            from tvm.relax.frontend.torch import from_fx
-            import torch.fx
-            fx_vae = torch.fx.symbolic_trace(traced_vae)
-            vae_mod = from_fx(fx_vae, [(1, latent_channels, latent_h, latent_w)], keep_params_as_input=True)
-            print(f"  ✓ DC-AE decoder traced for {res_name}")
+                torch.onnx.export(
+                    vae_wrapper, (dummy_latent,), onnx_vae_path,
+                    input_names=["latent"], output_names=["image"],
+                    dynamic_axes=None, opset_version=18,
+                )
+            onnx_size = os.path.getsize(onnx_vae_path) / 1e6
+            # Check for external data file
+            data_path = onnx_vae_path + ".data"
+            if os.path.exists(data_path):
+                onnx_size += os.path.getsize(data_path) / 1e6
+            print(f"  ✓ VAE exported to ONNX: {onnx_vae_path} ({onnx_size:.1f} MB)")
         except Exception as e:
-            print(f"  JIT+FX trace failed ({e}), trying torch.export...")
+            print(f"  ONNX export failed ({e}), trying JIT trace + ONNX...")
             try:
-                from torch.export import export
-                from tvm.relax.frontend.torch import from_exported_program
                 with torch.no_grad():
-                    exported_vae = export(vae_wrapper, (dummy_latent,))
-                vae_mod = from_exported_program(exported_vae, keep_params_as_input=True)
-                print(f"  ✓ DC-AE decoder traced via torch.export for {res_name}")
+                    traced_vae = torch.jit.trace(vae_wrapper, (dummy_latent,))
+                torch.onnx.export(
+                    traced_vae, (dummy_latent,), onnx_vae_path,
+                    input_names=["latent"], output_names=["image"],
+                    dynamic_axes=None, opset_version=18,
+                )
+                print(f"  ✓ VAE exported via JIT trace → ONNX: {onnx_vae_path}")
             except Exception as e2:
-                print(f"  ✗ VAE trace failed for {res_name}: {e2}")
-                # Save ONNX as fallback
+                print(f"  ✗ VAE export failed for {res_name}: {e2}")
+                # Save TVM IR for debugging
                 try:
-                    onnx_path = f"{variant_dir}/sana_vae_{res_name}.onnx"
-                    torch.onnx.export(
-                        vae_wrapper, (dummy_latent,), onnx_path,
-                        input_names=["latent"], output_names=["image"],
-                        dynamic_axes=None, opset_version=18,
-                    )
-                    print(f"  ✓ VAE exported to ONNX: {onnx_path}")
-                except Exception as e3:
-                    print(f"  ✗ ONNX export also failed: {e3}")
+                    from tvm.relax.frontend.torch import from_fx
+                    import torch.fx
+                    with torch.no_grad():
+                        traced = torch.jit.trace(vae_wrapper, (dummy_latent,))
+                    fx_mod = torch.fx.symbolic_trace(traced)
+                    from tvm.relax.frontend.torch import from_exported_program
+                    from torch.export import export
+                    exported = export(vae_wrapper, (dummy_latent,))
+                    vae_mod = from_exported_program(exported, keep_params_as_input=True)
+                    with open(f"{variant_dir}/vae_ir.txt", "w") as f:
+                        f.write(str(vae_mod))
+                except Exception:
+                    pass
 
         # --- Trace Transformer ---
         print(f"  Tracing Linear DiT for {res_name}...")
