@@ -1,67 +1,241 @@
 # Deployment and Operations Guide
 
-This document captures a production-oriented workflow for building, testing, and shipping the Web Stable Diffusion demo. It consolidates container definitions, scripted entry points, CI/CD automation, CDN packaging, and operational guard rails.
+This document covers all deployment paths for Web Stable Diffusion: the recommended server-side Diffusers runtime, the browser-side WebGPU compilation path, and hybrid architectures that combine both.
 
-## 1. Toolchain Containers and Conda Environments
+---
 
-### Docker toolchain image
+## Server Deployment (Recommended)
 
-The [`docker/Dockerfile.toolchain`](../docker/Dockerfile.toolchain) image provisions all build-time dependencies including Emscripten, Rust, `wasm-pack`, and Jekyll.
+The fastest way to generate real images is via the Python FastAPI backend powered by HuggingFace Diffusers.
 
+### Quick Start
+
+```bash
+pip install -e ".[all]"
+export OMNIMODAL_DIFFUSERS_MODEL=stabilityai/stable-diffusion-xl-base-1.0
+uvicorn web_stable_diffusion.runtime.api:app --host 0.0.0.0 --port 8000
 ```
-# Build the toolchain image
+
+### Docker Deployment
+
+Build and run with Docker Compose (recommended):
+
+```bash
+docker compose up
+```
+
+Or build the image directly:
+
+```bash
+docker build -t web-sd .
+docker run --gpus all -p 8000:8000 \
+  -e OMNIMODAL_DIFFUSERS_MODEL=stabilityai/stable-diffusion-xl-base-1.0 \
+  -v hf-cache:/root/.cache/huggingface \
+  web-sd
+```
+
+The [`Dockerfile`](../Dockerfile) at the project root uses `pytorch/pytorch:2.1.0-cuda12.1-cudnn8-runtime` as the base image and installs all dependencies from `requirements.txt` and `setup.py`.
+
+The [`docker-compose.yml`](../docker-compose.yml) reserves an NVIDIA GPU, exposes port 8000, and mounts a named volume for the HuggingFace model cache so models are downloaded only once.
+
+### Environment Variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `OMNIMODAL_DIFFUSERS_MODEL` | `stabilityai/stable-diffusion-xl-base-1.0` | HuggingFace model ID or local path |
+| `OMNIMODAL_DIFFUSERS_DTYPE` | `float16` | Torch dtype for inference |
+| `OMNIMODAL_DIFFUSERS_STEPS` | `25` | Number of inference steps |
+| `OMNIMODAL_DIFFUSERS_GUIDANCE` | `7.5` | Classifier-free guidance scale |
+| `OMNIMODAL_DIFFUSERS_NEGATIVE_PROMPT` | *(none)* | Default negative prompt |
+| `OMNIMODAL_DIFFUSERS_LORA` | *(none)* | LoRA weights path or HuggingFace ID |
+| `OMNIMODAL_TORCH_COMPILE` | `0` | Set to `1` to enable `torch.compile` |
+| `OMNIMODAL_API_KEY` | *(none)* | API key for `X-API-Key` authentication |
+| `OMNIMODAL_RATE_LIMIT` | `60` | Max requests per rate-limit period |
+| `OMNIMODAL_RATE_PERIOD` | `60` | Rate-limit window in seconds |
+| `OMNIMODAL_MANIFEST_DB` | `log_db/manifests.db` | SQLite path for manifest persistence |
+
+### API Endpoints
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/generate` | Generate image from text prompt (streaming JSONL) |
+| `POST` | `/img2img` | Image-to-image generation |
+| `POST` | `/cancel/{token_id}` | Cancel an in-progress generation |
+| `GET` | `/manifests` | List recent generation manifests |
+| `GET` | `/manifests/{token_id}` | Retrieve a specific manifest |
+| `DELETE` | `/manifests/{token_id}` | Delete a manifest |
+| `GET` | `/healthz` | Health check |
+
+#### Example: text-to-image
+
+```bash
+curl -N -X POST http://localhost:8000/generate \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "A cat sitting on a rainbow"}'
+```
+
+The response is a stream of JSON Lines. Each line is either a progress event (with step number and preview) or the final manifest containing the base64-encoded image and metadata.
+
+#### Example: authenticated request
+
+```bash
+curl -N -X POST http://localhost:8000/generate \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: your-api-key" \
+  -d '{"prompt": "Mountain landscape at sunset"}'
+```
+
+---
+
+## Browser WebGPU Deployment (Advanced)
+
+The original MLC project compiles Stable Diffusion to run entirely in the browser via WebGPU. This path requires the TVM compilation toolchain and is best suited for offline demos or edge deployments.
+
+### Prerequisites
+
+The build toolchain requires Emscripten, Rust with the `wasm32-unknown-unknown` target, `wasm-pack`, Node.js, and Jekyll. Two provisioning methods are provided:
+
+**Docker toolchain image:**
+
+```bash
 DOCKER_BUILDKIT=1 docker build \
   -f docker/Dockerfile.toolchain \
   -t websd/toolchain:latest .
 
-# Start an interactive shell with the project mounted
 docker run --rm -it \
   -v "$PWD":/workspace \
   -p 8889:8889 \
   websd/toolchain:latest
 ```
 
-The container sets up `emsdk_env.sh`, the Rust `wasm32-unknown-unknown` target, the tokenizer build chain, and pre-downloads the tvm.js runtime. After launching the container, the `make` targets described below are immediately available.
+**Conda environment:**
 
-### Conda environment
-
-For teams standardising on Conda/Mamba, [`environments/toolchain.yml`](../environments/toolchain.yml) mirrors the toolchain.
-
-```
-# Create and activate the environment
+```bash
 mamba env create -f environments/toolchain.yml
 mamba activate websd-toolchain
-
-# Finish the Ruby portion of the toolchain
-bundle config set path "$CONDA_PREFIX/lib/ruby/gems"  # optional vendor location
 gem install jekyll jekyll-remote-theme
-
-# Install the project's Python dependencies that require an external wheel index
 pip install -r requirements.txt
 pip install mlc-ai-nightly -f https://mlc.ai/wheels
 ```
 
-The environment pins the versions of Emscripten, Rust, `wasm-pack`, and includes Jekyll via `conda-forge`. Ruby gems are installed into the active environment to keep the runtime self-contained.
+### Build Steps
 
-## 2. Scripted build entry points
+1. Install TVM Unity via `pip3 install mlc-ai-nightly -f https://mlc.ai/wheels` or build from source (checkout `origin/unity`).
 
-The project now exposes a Makefile with opinionated targets:
+2. Import, optimize, and build the model:
+   ```bash
+   python3 build.py                    # Apple M-series (default)
+   python3 build.py --target cuda      # CUDA GPUs
+   ```
+
+3. Prepare web dependencies:
+   ```bash
+   make deps
+   ```
+
+4. Compile to WebGPU/WASM:
+   ```bash
+   make webgpu
+   ```
+
+5. Serve the site:
+   ```bash
+   make serve
+   ```
+
+6. Open Chrome Canary at `http://localhost:8889/`. For best performance, launch with:
+   ```bash
+   /Applications/Google\ Chrome\ Canary.app/Contents/MacOS/Google\ Chrome\ Canary \
+     --enable-dawn-features=disable_robustness
+   ```
+
+### Build Targets
 
 ```
 make deps        # Download tvm.js, wasm tokenizer, and supporting assets
 make webgpu      # Compile Stable Diffusion for the WebGPU runtime
-make site        # Assemble the static site into site/dist (CONFIG=web/gh-page-config.json overrides)
-make serve       # Serve the site locally via Jekyll (PORT=8890 overrides)
+make site        # Assemble the static site into site/dist/
+make serve       # Serve the site locally via Jekyll
 make package     # Emit CDN-friendly tarballs under dist/packages/
 ```
 
-All targets can be chained by CI/CD pipelines or executed locally. `make serve` blocks with a long-running Jekyll process so it should be run in a dedicated terminal or supervisor.
+---
 
-## 3. CI/CD automation template
+## Hybrid Architecture (Frontend + Backend)
 
-The workflow below automates builds on GitHub Actions using the scripted entry points and publishes to GitHub Pages. Save it as [`.github/workflows/site-deploy.yml`](../.github/workflows/site-deploy.yml).
+The React single-page application under `web/` connects to the FastAPI streaming backend. This is the recommended setup for interactive use.
 
+### How It Works
+
+1. The FastAPI server runs the Diffusers pipeline and streams JSONL progress events.
+2. The React frontend consumes the stream and renders previews in real time.
+3. As each modality completes, the UI updates the canvas, audio player, video preview, and telemetry panel.
+
+### Configuration
+
+The frontend discovers the backend via one of these methods (in priority order):
+
+1. `window.__omnimodalApiConfig = { baseUrl: "http://your-server:8000" }` in the HTML.
+2. `localStorage` key `omnimodal.apiBaseUrl`.
+3. Automatic default to `http://127.0.0.1:8000` when served from `localhost`.
+
+If the backend is unreachable, the UI falls back to the legacy `tvmjsGlobalEnv` WebGPU pipeline.
+
+### Running Locally
+
+Terminal 1 (backend):
+```bash
+docker compose up
 ```
+
+Terminal 2 (frontend):
+```bash
+cd web && npm install && npm start
+```
+
+Or serve the pre-built static site:
+```bash
+make site CONFIG=web/gh-page-config.json
+npx http-server site/dist -p 4173
+```
+
+### Production Setup
+
+For production, place the static frontend behind a CDN and point it at the FastAPI backend. Use a reverse proxy (nginx, Caddy, etc.) to handle TLS termination and CORS:
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name sd.example.com;
+
+    location / {
+        root /var/www/websd/dist;
+        try_files $uri $uri/ /index.html;
+    }
+
+    location /generate {
+        proxy_pass http://127.0.0.1:8000;
+        proxy_buffering off;
+        proxy_set_header Connection '';
+        proxy_http_version 1.1;
+        chunked_transfer_encoding off;
+    }
+
+    location /img2img { proxy_pass http://127.0.0.1:8000; }
+    location /healthz { proxy_pass http://127.0.0.1:8000; }
+    location /manifests { proxy_pass http://127.0.0.1:8000; }
+}
+```
+
+---
+
+## CI/CD Automation
+
+### GitHub Actions Workflow
+
+Save as `.github/workflows/site-deploy.yml`:
+
+```yaml
 name: Build and Deploy Web Stable Diffusion
 
 on:
@@ -135,48 +309,38 @@ jobs:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           publish_dir: site/dist
           commit_message: Deploy Web Stable Diffusion site
-      - name: Smoke-test deployed CDN
-        run: |
-          curl -f https://websd.example.com/stable_diffusion.js
-          curl -f https://websd.example.com/stable_diffusion_webgpu.wasm
 ```
 
-### Pipeline notes
+---
 
-- Use repository secrets for any access tokens (e.g. `AWS_ACCESS_KEY_ID`) referenced by additional steps.
-- The build job archives both the compiled wasm artifacts (`dist/`) and the static site (`site/dist`). The deploy job retrieves the artifacts and pushes to GitHub Pages (or any other Git ref you configure).
-- The smoke tests perform HTTP health checks by requesting the JavaScript harness and the primary WASM module. Replace the URLs with your CDN hostnames.
+## CDN Packaging
 
-## 4. CDN packaging & promotion
-
-The `make package` target creates two tarballs under `dist/packages/`:
-
-- `websd-site.tar.gz` – static site assets ready to upload to object storage or a CDN origin.
-- `websd-model.tar.gz` – compiled WebGPU binaries and schedulers that can be versioned independently.
-
-Example upload and promotion flow:
-
-```
+```bash
 make package
 aws s3 sync dist/packages s3://websd-artifacts/releases/$(git rev-parse --short HEAD)/
-aws cloudfront create-invalidation --distribution-id <id> --paths '/stable_diffusion.js' '/stable_diffusion_webgpu.wasm'
+aws cloudfront create-invalidation --distribution-id <id> \
+  --paths '/stable_diffusion.js' '/stable_diffusion_webgpu.wasm'
 ```
 
-Version the artifacts by commit SHA or semantic release. Store checksums alongside the tarballs (`shasum -a 256 dist/packages/*.tar.gz > dist/packages/sha256sum.txt`) to support provenance tracking.
+Version artifacts by commit SHA or semantic release. Store checksums alongside tarballs for provenance tracking:
 
-## 5. Operational readiness
+```bash
+shasum -a 256 dist/packages/*.tar.gz > dist/packages/sha256sum.txt
+```
 
-### Health checks
+---
 
-- **Edge health** – Use `curl -f` (as in the CI smoke tests) against key static resources. Automate these with your monitoring platform at 1–5 minute intervals.
-- **Model availability** – Verify that `dist/tokenizers-wasm` is reachable and contains `pkg/package.json`. Static site monitors can fetch the JSON and validate the `version` field against the expected release.
-- **Browser sanity** – Run `npm install -g @web/test-runner` and script a headless WebGPU smoke test that loads the index.html via `npx http-server site/dist -p 4173` and performs a prompt round-trip. Integrate the test into nightly CI.
+## Operational Readiness
 
-### Rollback strategy
+### Health Checks
 
-1. **Immutable artifacts** – Because `make package` names outputs deterministically, keep at least the last two releases in your CDN bucket.
-2. **Automated rollback** – Maintain a `rollback` job in CI that downloads the previous artifact (tracked via a manifest or Git tag) and republishes it to your hosting target.
-3. **Versioned config** – The site configuration (`site/stable-diffusion-config.json`) is built from the `CONFIG` file passed to `make site`. Store historical configs in Git so a rollback reuses the previous JSON without manual edits.
-4. **Verification gate** – After any rollback, rerun the smoke tests and confirm logs via your CDN provider. Only mark the incident resolved once the checks succeed.
+- **API health:** `curl -f http://localhost:8000/healthz` returns a 200 with pipeline status.
+- **Edge health:** Monitor key static resources at 1-5 minute intervals.
+- **Model availability:** Verify `dist/tokenizers-wasm` contains `pkg/package.json`.
 
-With these assets, teams can reproduce the build, ship to staging or production, monitor the deployment, and revert quickly if necessary.
+### Rollback Strategy
+
+1. Keep at least the last two releases in your CDN bucket (artifacts are named deterministically by `make package`).
+2. Maintain a `rollback` CI job that re-publishes the previous artifact.
+3. Store historical site configs in Git so rollbacks reuse the correct JSON.
+4. Rerun smoke tests after any rollback before marking the incident resolved.

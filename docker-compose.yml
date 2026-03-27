@@ -1,0 +1,21 @@
+services:
+  web-sd:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - OMNIMODAL_DIFFUSERS_MODEL=stabilityai/stable-diffusion-xl-base-1.0
+      - OMNIMODAL_DIFFUSERS_DTYPE=float16
+      - OMNIMODAL_DIFFUSERS_STEPS=25
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    volumes:
+      - hf-cache:/root/.cache/huggingface
+
+volumes:
+  hf-cache:

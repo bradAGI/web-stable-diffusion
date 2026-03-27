@@ -1,5 +1,44 @@
 # Web Stable Diffusion
 
+Generate images using Stable Diffusion -- server-side via HuggingFace Diffusers or client-side via WebGPU.
+
+## Quick Start (Server)
+
+```bash
+pip install -e ".[all]"
+uvicorn web_stable_diffusion.runtime.api:app --host 0.0.0.0 --port 8000
+```
+
+Then visit `http://localhost:8000` or use the API:
+
+```bash
+curl -N -X POST http://localhost:8000/generate \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "A cat sitting on a rainbow"}'
+```
+
+## Quick Start (Docker)
+
+```bash
+docker compose up
+```
+
+## Features
+
+- Real image generation via Stable Diffusion XL (default) or SD 1.5
+- img2img support
+- LoRA adapter loading
+- Streaming JSONL API with progress events
+- DPMSolver++ scheduler for fast inference (25 steps)
+- torch.compile optimization
+- API key authentication and rate limiting
+- Manifest persistence for auditing
+- CLI for batch generation
+
+See [docs/deployment.md](docs/deployment.md) for full deployment guidance including Docker, environment variables, API reference, and hybrid frontend/backend setup.
+
+---
+
 This project started as an experiment to bring stable diffusion models into the browser. The original WebGPU demo still runs fully client-side, but the modern omni-modal workflow combines a Python runtime with a FastAPI streaming service that powers the React UI. The backend now exposes production-facing features such as persistent manifests, authentication, and rate limiting so the system can be deployed behind an API gateway or automation harness.
 
 You are also more than welcomed to checkout [Web LLM](https://github.com/mlc-ai/web-llm) if you are interested in deploying LLM-based chat bots to browser.
