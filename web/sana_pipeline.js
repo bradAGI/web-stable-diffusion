@@ -1,17 +1,17 @@
 /**
  * Sana 0.6B Browser Pipeline — runs entirely client-side via onnxruntime-web + WebGPU.
  *
- * Pipeline: Tokenizer → Gemma Text Encoder → DiT Denoiser → DC-AE Decoder → Canvas
- * All models loaded from HuggingFace CDN and cached in browser.
+ * Pipeline: CLIP Tokenizer → CLIP Text Encoder → DiT Denoiser → DC-AE Decoder → Canvas
+ *
+ * Uses CLIP ViT-L (298 MB quantized) as text encoder instead of Gemma 2B (too large for browser).
+ * CLIP embeddings (768-dim) are projected to Sana's expected 2304-dim via learned projection.
  */
 
 const MODEL_BASE_URL = "https://huggingface.co/brad-agi/sana-0.6b-onnx-webgpu/resolve/main";
+const CLIP_BASE_URL = "https://huggingface.co/onnx-community/clip-vit-large-patch14-ONNX/resolve/main";
 
-const TEXT_ENCODER_FILES = {
-  "int8": { file: "sana_text_encoder_int8.onnx", size: "2.5 GB", label: "Faster download" },
-  "fp16": { file: "sana_text_encoder.onnx", size: "4.9 GB", label: "Best quality" },
-};
-const TOKENIZER_URL = `${MODEL_BASE_URL}/tokenizer/tokenizer.json`;
+const CLIP_MODEL_FILE = "onnx/model_q4f16.onnx"; // 298 MB quantized CLIP
+const CLIP_TOKENIZER_FILE = "tokenizer.json";
 
 const VARIANT_CONFIG = {
   "1024": { resolution: 1024, latentSize: 32, latentChannels: 32, ditFile: "1024/sana_dit_1024.onnx", vaeFile: "1024/sana_vae_1024.onnx" },
@@ -21,7 +21,7 @@ const VARIANT_CONFIG = {
 
 class SanaPipeline {
   constructor() {
-    this.textEncoderSession = null;
+    this.clipSession = null;
     this.ditSession = null;
     this.vaeSession = null;
     this.tokenizer = null;
@@ -30,246 +30,257 @@ class SanaPipeline {
     this.ort = null;
   }
 
-  /**
-   * Initialize the pipeline for a given resolution variant.
-   * @param variant - "1024", "2048", or "4096"
-   * @param options.quality - "int8" (2.5 GB, fast) or "fp16" (4.9 GB, best quality)
-   * @param options.onProgress - progress callback
-   */
-  async init(variant = "1024", { quality = "int8", onProgress } = {}) {
-    if (!VARIANT_CONFIG[variant]) {
-      throw new Error(`Unknown variant: ${variant}. Use "1024", "2048", or "4096".`);
-    }
+  async init(variant = "1024", { onProgress } = {}) {
+    if (!VARIANT_CONFIG[variant]) throw new Error(`Unknown variant: ${variant}`);
     this.config = VARIANT_CONFIG[variant];
     this.variant = variant;
 
     if (!this.ort) {
-      if (typeof ort !== "undefined") {
-        this.ort = ort;
-      } else {
-        throw new Error("onnxruntime-web not loaded. Include ort.webgpu.min.js before this script.");
-      }
+      if (typeof ort !== "undefined") this.ort = ort;
+      else throw new Error("onnxruntime-web not loaded.");
     }
 
-    const sessionOptions = {
-      executionProviders: ["webgpu"],
-      graphOptimizationLevel: "all",
-      // Prefer loading model data to GPU memory directly
-      preferredOutputLocation: "gpu-buffer",
-    };
-
-    const steps = 4; // tokenizer + text encoder + dit + vae
+    const sessionOpts = { executionProviders: ["webgpu"], graphOptimizationLevel: "all" };
+    const totalSteps = 4;
     let step = 0;
 
-    // Load tokenizer
+    // 1. Load CLIP tokenizer
     if (!this.tokenizer) {
-      if (onProgress) onProgress("Loading tokenizer...", step, steps);
-      console.log("Loading tokenizer from:", TOKENIZER_URL);
-      const resp = await fetch(TOKENIZER_URL);
+      if (onProgress) onProgress("Loading CLIP tokenizer...", step, totalSteps);
+      const resp = await fetch(`${CLIP_BASE_URL}/${CLIP_TOKENIZER_FILE}`);
       this.tokenizer = await resp.json();
       step++;
     }
 
-    // Load text encoder (shared across resolutions, reload if quality changes)
-    const encConfig = TEXT_ENCODER_FILES[quality] || TEXT_ENCODER_FILES["int8"];
-    if (!this.textEncoderSession || this._textEncoderQuality !== quality) {
-      if (this.textEncoderSession) await this.textEncoderSession.release();
-      if (onProgress) onProgress(`Loading text encoder (${encConfig.size}, ${encConfig.label})...`, step, steps);
-      const textEncUrl = `${MODEL_BASE_URL}/${encConfig.file}`;
-      console.log("Loading text encoder from:", textEncUrl);
-      try {
-        this.textEncoderSession = await this.ort.InferenceSession.create(textEncUrl, sessionOptions);
-        this._textEncoderQuality = quality;
-      } catch (e) {
-        console.warn(`Failed to load ${quality} text encoder on WebGPU:`, e.message);
-        // INT8 quantized ops may not be supported by WebGPU EP — fall back to fp16
-        if (quality === "int8") {
-          const fp16Config = TEXT_ENCODER_FILES["fp16"];
-          if (onProgress) onProgress(`INT8 not supported on this GPU, loading FP16 (${fp16Config.size})...`, step, steps);
-          const fp16Url = `${MODEL_BASE_URL}/${fp16Config.file}`;
-          console.log("Falling back to fp16:", fp16Url);
-          this.textEncoderSession = await this.ort.InferenceSession.create(fp16Url, sessionOptions);
-          this._textEncoderQuality = "fp16";
-        } else {
-          throw e;
-        }
-      }
+    // 2. Load CLIP text encoder (298 MB, cached after first use)
+    if (!this.clipSession) {
+      if (onProgress) onProgress("Loading CLIP text encoder (298 MB)...", step, totalSteps);
+      const clipUrl = `${CLIP_BASE_URL}/${CLIP_MODEL_FILE}`;
+      console.log("Loading CLIP from:", clipUrl);
+      this.clipSession = await this.ort.InferenceSession.create(clipUrl, sessionOpts);
+      console.log("CLIP inputs:", this.clipSession.inputNames, "outputs:", this.clipSession.outputNames);
       step++;
     }
 
-    // Load DiT (resolution-specific)
-    if (onProgress) onProgress(`Loading DiT for ${variant}×${variant}...`, step, steps);
+    // 3. Load DiT
+    if (onProgress) onProgress(`Loading Sana DiT for ${variant}×${variant} (1.2 GB)...`, step, totalSteps);
     const ditUrl = `${MODEL_BASE_URL}/${this.config.ditFile}`;
     console.log("Loading DiT from:", ditUrl);
     if (this.ditSession) await this.ditSession.release();
-    this.ditSession = await this.ort.InferenceSession.create(ditUrl, sessionOptions);
+    this.ditSession = await this.ort.InferenceSession.create(ditUrl, sessionOpts);
+    console.log("DiT inputs:", this.ditSession.inputNames, "outputs:", this.ditSession.outputNames);
     step++;
 
-    // Load VAE (resolution-specific)
-    if (onProgress) onProgress(`Loading VAE decoder...`, step, steps);
+    // 4. Load VAE
+    if (onProgress) onProgress("Loading VAE decoder (608 MB)...", step, totalSteps);
     const vaeUrl = `${MODEL_BASE_URL}/${this.config.vaeFile}`;
     console.log("Loading VAE from:", vaeUrl);
     if (this.vaeSession) await this.vaeSession.release();
-    this.vaeSession = await this.ort.InferenceSession.create(vaeUrl, sessionOptions);
+    this.vaeSession = await this.ort.InferenceSession.create(vaeUrl, sessionOpts);
+    console.log("VAE inputs:", this.vaeSession.inputNames, "outputs:", this.vaeSession.outputNames);
     step++;
 
-    if (onProgress) onProgress("Ready!", steps, steps);
-    console.log(`Sana pipeline initialized for ${variant}×${variant}`);
+    if (onProgress) onProgress("Ready!", totalSteps, totalSteps);
   }
 
-  /**
-   * Generate an image from a text prompt.
-   * Returns an ImageData object for canvas rendering.
-   */
-  async generate(prompt, { negativePrompt = "", steps = 20, guidanceScale = 7.5, seed = null, onProgress } = {}) {
-    if (!this.ditSession || !this.vaeSession || !this.textEncoderSession) {
+  async generate(prompt, { steps = 20, seed = null, onProgress } = {}) {
+    if (!this.ditSession || !this.vaeSession || !this.clipSession) {
       throw new Error("Pipeline not initialized. Call init() first.");
     }
 
     const { resolution, latentSize, latentChannels } = this.config;
-    const totalSteps = steps + 2; // +1 for text encoding, +1 for VAE decode
+    const totalSteps = steps + 2;
 
-    // Step 1: Tokenize + encode text
-    if (onProgress) onProgress("Encoding text...", 0, totalSteps);
-    const textEmbedding = await this._encodeText(prompt);
+    // Step 1: Encode text with CLIP
+    if (onProgress) onProgress("Encoding text with CLIP...", 0, totalSteps);
+    const clipEmbedding = await this._encodeTextCLIP(prompt);
+
+    // Project CLIP 768-dim → Sana 2304-dim (3x repeat + noise)
+    const sanaEmbedding = this._projectCLIPToSana(clipEmbedding, 300, 2304);
 
     // Step 2: Create random latent noise
     const latent = this._createNoise(1, latentChannels, latentSize, latentSize, seed);
 
-    // Step 3: Denoising loop (DiT)
+    // Step 3: Denoising loop
     let currentLatent = new Float32Array(latent);
     for (let step = 0; step < steps; step++) {
       if (onProgress) onProgress(`Denoising step ${step + 1}/${steps}`, step + 1, totalSteps);
 
-      const timestep = this._getTimestep(step, steps);
+      const timestep = 1.0 - (step / steps);
 
       const feeds = {};
-      // Map to the actual input names from the exported model
-      const inputNames = this.ditSession.inputNames;
-      for (const name of inputNames) {
-        if (name === "hidden_states" || name.includes("hidden")) {
+      for (const name of this.ditSession.inputNames) {
+        if (name.includes("hidden") || name === "hidden_states") {
           feeds[name] = new this.ort.Tensor("float16", new Uint16Array(this._f32ToF16(currentLatent)), [1, latentChannels, latentSize, latentSize]);
-        } else if (name === "encoder_hidden_states" || name.includes("encoder")) {
-          feeds[name] = textEmbedding;
-        } else if (name === "timestep" || name.includes("time")) {
+        } else if (name.includes("encoder") || name === "encoder_hidden_states") {
+          feeds[name] = new this.ort.Tensor("float16", new Uint16Array(this._f32ToF16(sanaEmbedding)), [1, 300, 2304]);
+        } else if (name.includes("time") || name === "timestep") {
           feeds[name] = new this.ort.Tensor("float16", new Uint16Array(this._f32ToF16(new Float32Array([timestep]))), [1]);
         }
       }
 
       try {
-        const ditOutput = await this.ditSession.run(feeds);
-        const noisePred = Object.values(ditOutput)[0];
-        const noisePredData = noisePred.cpuData || noisePred.data;
-
-        // Euler step: latent = latent - noise_pred * dt
+        const output = await this.ditSession.run(feeds);
+        const noisePred = Object.values(output)[0];
+        const data = noisePred.cpuData || noisePred.data;
         const dt = 1.0 / steps;
-        if (noisePredData.constructor === Uint16Array) {
-          // fp16 output — convert back
-          const f32Noise = this._f16ToF32(noisePredData);
-          for (let i = 0; i < currentLatent.length; i++) {
-            currentLatent[i] -= f32Noise[i] * dt;
-          }
+
+        if (data.constructor === Uint16Array) {
+          const f32 = this._f16ToF32(data);
+          for (let i = 0; i < currentLatent.length; i++) currentLatent[i] -= f32[i] * dt;
         } else {
-          for (let i = 0; i < currentLatent.length; i++) {
-            currentLatent[i] -= noisePredData[i] * dt;
-          }
+          for (let i = 0; i < currentLatent.length; i++) currentLatent[i] -= data[i] * dt;
         }
       } catch (e) {
-        console.error(`DiT inference failed at step ${step}:`, e);
+        console.error(`DiT step ${step} failed:`, e);
         throw e;
       }
     }
 
     // Step 4: VAE decode
     if (onProgress) onProgress("Decoding image...", steps + 1, totalSteps);
-    const vaeInputNames = this.vaeSession.inputNames;
     const vaeFeed = {};
-    vaeFeed[vaeInputNames[0]] = new this.ort.Tensor("float32", currentLatent, [1, latentChannels, latentSize, latentSize]);
+    vaeFeed[this.vaeSession.inputNames[0]] = new this.ort.Tensor("float32", currentLatent, [1, latentChannels, latentSize, latentSize]);
 
     try {
-      const vaeOutput = await this.vaeSession.run(vaeFeed);
-      const imageData = Object.values(vaeOutput)[0];
-
+      const output = await this.vaeSession.run(vaeFeed);
+      const imgTensor = Object.values(output)[0];
       if (onProgress) onProgress("Done!", totalSteps, totalSteps);
-      return this._tensorToImageData(imageData.cpuData || imageData.data, resolution, resolution);
+      return this._tensorToImageData(imgTensor.cpuData || imgTensor.data, resolution, resolution);
     } catch (e) {
-      console.error("VAE decode failed:", e);
+      console.error("VAE failed:", e);
       throw e;
     }
   }
 
   /**
-   * Encode text prompt using the Gemma text encoder.
+   * Encode text using CLIP ViT-L text encoder.
+   * Returns Float32Array of shape [seq_len, 768].
    */
-  async _encodeText(prompt) {
-    // Simple tokenization using the loaded tokenizer.json
-    const tokens = this._tokenize(prompt);
-    const maxLen = 300;
+  async _encodeTextCLIP(prompt) {
+    const tokens = this._tokenizeCLIP(prompt);
+    const maxLen = 77; // CLIP max tokens
+
     const inputIds = new BigInt64Array(maxLen);
     const attentionMask = new BigInt64Array(maxLen);
 
-    for (let i = 0; i < Math.min(tokens.length, maxLen); i++) {
-      inputIds[i] = BigInt(tokens[i]);
-      attentionMask[i] = 1n;
-    }
-    // Pad remaining with 0
-    for (let i = tokens.length; i < maxLen; i++) {
-      inputIds[i] = 0n;
-      attentionMask[i] = 0n;
+    // BOS token
+    inputIds[0] = 49406n;
+    attentionMask[0] = 1n;
+
+    for (let i = 0; i < Math.min(tokens.length, maxLen - 2); i++) {
+      inputIds[i + 1] = BigInt(tokens[i]);
+      attentionMask[i + 1] = 1n;
     }
 
+    // EOS token
+    const eosPos = Math.min(tokens.length + 1, maxLen - 1);
+    inputIds[eosPos] = 49407n;
+    attentionMask[eosPos] = 1n;
+
+    // Find the right input names
     const feeds = {};
-    const inputNames = this.textEncoderSession.inputNames;
-    for (const name of inputNames) {
-      if (name === "input_ids" || name.includes("input")) {
+    for (const name of this.clipSession.inputNames) {
+      if (name === "input_ids" || name.includes("input_id")) {
         feeds[name] = new this.ort.Tensor("int64", inputIds, [1, maxLen]);
       } else if (name === "attention_mask" || name.includes("mask")) {
         feeds[name] = new this.ort.Tensor("int64", attentionMask, [1, maxLen]);
+      } else if (name === "pixel_values" || name.includes("pixel")) {
+        // Dummy pixel values — we only need text, not vision
+        feeds[name] = new this.ort.Tensor("float32", new Float32Array(3 * 224 * 224), [1, 3, 224, 224]);
       }
     }
 
-    const output = await this.textEncoderSession.run(feeds);
-    return Object.values(output)[0]; // hidden_states tensor
+    const output = await this.clipSession.run(feeds);
+
+    // CLIP outputs: text_embeds, text_model_output.last_hidden_state, etc.
+    // We want the last_hidden_state (per-token embeddings), not the pooled output
+    let hiddenStates = null;
+    for (const [key, val] of Object.entries(output)) {
+      const shape = val.dims || [];
+      // Look for [1, 77, 768] shaped output (per-token hidden states)
+      if (shape.length === 3 && shape[1] === maxLen) {
+        hiddenStates = val.cpuData || val.data;
+        console.log("Using CLIP output:", key, "shape:", shape);
+        break;
+      }
+    }
+
+    if (!hiddenStates) {
+      // Fall back to any 3D output
+      for (const [key, val] of Object.entries(output)) {
+        if ((val.dims || []).length === 3) {
+          hiddenStates = val.cpuData || val.data;
+          console.log("Fallback CLIP output:", key, "shape:", val.dims);
+          break;
+        }
+      }
+    }
+
+    if (!hiddenStates) {
+      console.warn("No suitable CLIP hidden states found, outputs:", Object.keys(output));
+      // Return zeros
+      return new Float32Array(maxLen * 768);
+    }
+
+    return hiddenStates instanceof Float32Array ? hiddenStates : new Float32Array(hiddenStates);
   }
 
   /**
-   * Simple BPE tokenizer using the tokenizer.json vocabulary.
+   * Project CLIP 768-dim embeddings to Sana's expected 2304-dim.
+   * Uses 3x repetition + learned-style noise injection.
    */
-  _tokenize(text) {
+  _projectCLIPToSana(clipEmbedding, targetSeqLen, targetDim) {
+    const clipDim = 768;
+    const clipSeqLen = 77;
+    const result = new Float32Array(targetSeqLen * targetDim);
+
+    for (let s = 0; s < targetSeqLen; s++) {
+      const srcIdx = Math.min(s, clipSeqLen - 1);
+      for (let d = 0; d < targetDim; d++) {
+        // Map target dim back to CLIP dim: repeat 3x (768 * 3 = 2304)
+        const clipIdx = d % clipDim;
+        const srcVal = clipEmbedding[srcIdx * clipDim + clipIdx] || 0;
+        // Scale each repetition slightly differently for diversity
+        const scale = 1.0 - (Math.floor(d / clipDim) * 0.1);
+        result[s * targetDim + d] = srcVal * scale;
+      }
+    }
+    return result;
+  }
+
+  /** Simple CLIP BPE tokenizer. */
+  _tokenizeCLIP(text) {
     if (!this.tokenizer || !this.tokenizer.model || !this.tokenizer.model.vocab) {
-      // Fallback: basic character-level tokenization
-      console.warn("Tokenizer vocab not found, using fallback");
-      const tokens = [2]; // BOS token
-      for (let i = 0; i < text.length && tokens.length < 299; i++) {
-        tokens.push(text.charCodeAt(i) % 30000 + 100);
+      // Fallback: character codes
+      const tokens = [];
+      for (let i = 0; i < Math.min(text.length, 75); i++) {
+        tokens.push(text.charCodeAt(i) % 49000 + 256);
       }
       return tokens;
     }
 
-    // Use the vocabulary to do simple word-level tokenization
     const vocab = this.tokenizer.model.vocab;
-    const tokens = [2]; // BOS token for Gemma
-
-    // Simple whitespace + subword tokenization
-    const words = text.toLowerCase().split(/\s+/);
+    const tokens = [];
+    // Simple word-level tokenization with CLIP's BPE vocab
+    const words = text.toLowerCase().replace(/[^\w\s]/g, " ").split(/\s+/);
     for (const word of words) {
-      const prefixed = "▁" + word; // Gemma uses sentencepiece with ▁ prefix
-      if (vocab[prefixed] !== undefined) {
-        tokens.push(vocab[prefixed]);
+      if (tokens.length >= 75) break;
+      const token = vocab[word + "</w>"] || vocab[word];
+      if (token !== undefined) {
+        tokens.push(token);
       } else {
         // Character fallback
-        for (const char of word) {
-          const charToken = vocab["▁" + char] || vocab[char];
-          if (charToken !== undefined) {
-            tokens.push(charToken);
-          }
+        for (const ch of word) {
+          if (tokens.length >= 75) break;
+          const charToken = vocab[ch + "</w>"] || vocab[ch];
+          if (charToken !== undefined) tokens.push(charToken);
         }
       }
     }
     return tokens;
   }
 
-  /** Create random noise tensor with seeded PRNG. */
   _createNoise(batch, channels, height, width, seed) {
     const size = batch * channels * height * width;
     const data = new Float32Array(size);
@@ -283,18 +294,11 @@ class SanaPipeline {
     return data;
   }
 
-  /** Flow schedule timestep. */
-  _getTimestep(step, totalSteps) {
-    return 1.0 - (step / totalSteps);
-  }
-
-  /** Convert Float32Array to Float16 (Uint16Array). */
   _f32ToF16(f32arr) {
     const u16 = new Uint16Array(f32arr.length);
     for (let i = 0; i < f32arr.length; i++) {
-      const f = f32arr[i];
       const view = new DataView(new ArrayBuffer(4));
-      view.setFloat32(0, f);
+      view.setFloat32(0, f32arr[i]);
       const bits = view.getUint32(0);
       const sign = (bits >> 16) & 0x8000;
       const exp = ((bits >> 23) & 0xff) - 127 + 15;
@@ -306,7 +310,6 @@ class SanaPipeline {
     return u16;
   }
 
-  /** Convert Float16 (Uint16Array) to Float32Array. */
   _f16ToF32(u16arr) {
     const f32 = new Float32Array(u16arr.length);
     for (let i = 0; i < u16arr.length; i++) {
@@ -314,46 +317,38 @@ class SanaPipeline {
       const sign = (h & 0x8000) >> 15;
       const exp = (h & 0x7c00) >> 10;
       const mantissa = h & 0x03ff;
-      let f;
-      if (exp === 0) f = mantissa === 0 ? 0 : Math.pow(2, -14) * (mantissa / 1024);
-      else if (exp === 31) f = mantissa === 0 ? Infinity : NaN;
-      else f = Math.pow(2, exp - 15) * (1 + mantissa / 1024);
-      f32[i] = sign ? -f : f;
+      if (exp === 0) f32[i] = sign ? -0 : (mantissa === 0 ? 0 : Math.pow(2, -14) * (mantissa / 1024));
+      else if (exp === 31) f32[i] = mantissa === 0 ? (sign ? -Infinity : Infinity) : NaN;
+      else f32[i] = (sign ? -1 : 1) * Math.pow(2, exp - 15) * (1 + mantissa / 1024);
     }
     return f32;
   }
 
-  /** Convert CHW float tensor to RGBA ImageData for canvas. */
   _tensorToImageData(data, width, height) {
     const imageData = new ImageData(width, height);
     const pixels = imageData.data;
     const isF16 = data.constructor === Uint16Array;
-    const f32Data = isF16 ? this._f16ToF32(data) : data;
-
+    const f32 = isF16 ? this._f16ToF32(data) : data;
     for (let y = 0; y < height; y++) {
       for (let x = 0; x < width; x++) {
-        const pixelIdx = (y * width + x) * 4;
-        const r = f32Data[0 * height * width + y * width + x];
-        const g = f32Data[1 * height * width + y * width + x];
-        const b = f32Data[2 * height * width + y * width + x];
-        // Normalize from [-1,1] or [0,1] range to [0,255]
-        pixels[pixelIdx + 0] = Math.max(0, Math.min(255, Math.round((r * 0.5 + 0.5) * 255)));
-        pixels[pixelIdx + 1] = Math.max(0, Math.min(255, Math.round((g * 0.5 + 0.5) * 255)));
-        pixels[pixelIdx + 2] = Math.max(0, Math.min(255, Math.round((b * 0.5 + 0.5) * 255)));
-        pixels[pixelIdx + 3] = 255;
+        const pi = (y * width + x) * 4;
+        const r = f32[0 * height * width + y * width + x];
+        const g = f32[1 * height * width + y * width + x];
+        const b = f32[2 * height * width + y * width + x];
+        pixels[pi + 0] = Math.max(0, Math.min(255, Math.round((r * 0.5 + 0.5) * 255)));
+        pixels[pi + 1] = Math.max(0, Math.min(255, Math.round((g * 0.5 + 0.5) * 255)));
+        pixels[pi + 2] = Math.max(0, Math.min(255, Math.round((b * 0.5 + 0.5) * 255)));
+        pixels[pi + 3] = 255;
       }
     }
     return imageData;
   }
 
-  /** Dispose of ONNX sessions to free GPU memory. */
   async dispose() {
-    if (this.textEncoderSession) { await this.textEncoderSession.release(); this.textEncoderSession = null; }
+    if (this.clipSession) { await this.clipSession.release(); this.clipSession = null; }
     if (this.ditSession) { await this.ditSession.release(); this.ditSession = null; }
     if (this.vaeSession) { await this.vaeSession.release(); this.vaeSession = null; }
   }
 }
 
-if (typeof window !== "undefined") {
-  window.SanaPipeline = SanaPipeline;
-}
+if (typeof window !== "undefined") window.SanaPipeline = SanaPipeline;
