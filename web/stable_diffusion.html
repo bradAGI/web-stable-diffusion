@@ -244,12 +244,15 @@
     </script>
 
     <!-- ONNX Runtime Web with WebGPU -->
-    <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.21.0/dist/ort.webgpu.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/ort.all.min.js"></script>
     <script>
-      // Configure ONNX Runtime for large models
+      // Configure ONNX Runtime
       if (typeof ort !== "undefined") {
-        ort.env.wasm.numThreads = navigator.hardwareConcurrency || 4;
+        ort.env.wasm.numThreads = 1; // Avoid cross-origin issues
         ort.env.wasm.simd = true;
+        // Log available backends
+        console.log("ORT version:", ort.env.versions?.web || "unknown");
+        console.log("ORT backends:", Object.keys(ort.env));
       }
     </script>
     <!-- Sana ONNX Pipeline -->
