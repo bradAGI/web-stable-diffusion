@@ -1,8 +1,7 @@
 {
     "schedulerConstUrl": [
         "https://websd.mlc.ai/dist/scheduler_dpm_solver_multistep_consts.json",
-        "https://websd.mlc.ai/dist/scheduler_pndm_consts.json",
-        "https://websd.mlc.ai/dist/scheduler_euler_discrete_consts.json"
+        "https://websd.mlc.ai/dist/scheduler_pndm_consts.json"
     ],
     "tokenizer": "openai/clip-vit-large-patch14",
     "tokenizer2": "openai/clip-vit-large-patch14",
