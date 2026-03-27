@@ -162,9 +162,10 @@ class SanaPipeline {
 
         if (step === 0) {
           console.log("DiT output type:", rawData.constructor.name, "length:", rawData.length, "expected:", currentLatent.length);
-          // Sample some values
-          const sample = rawData.constructor === Uint16Array ? this._f16ToF32(rawData.slice(0, 5)) : Array.from(rawData.slice(0, 5));
-          console.log("DiT output sample:", sample);
+          const vals = Array.from(rawData.slice(0, 10));
+          console.log("DiT output first 10 values:", vals);
+          console.log("Any non-zero?", vals.some(v => v !== 0 && !isNaN(v)));
+          console.log("currentLatent first 5 before update:", Array.from(currentLatent.slice(0, 5)));
         }
 
         const dt = 1.0 / steps;
