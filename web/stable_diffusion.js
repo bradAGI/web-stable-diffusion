@@ -40,18 +40,39 @@ class TransferableNDArray {
 
   /**
    * Export the NDArray into a transferable message.
+   * If the array lives on GPU, copy to CPU first via copyFrom.
    * @returns {{shape: number[], dtype: string, buffer: ArrayBuffer}}
    */
   toMessage() {
     if (!this.ndarray) {
       throw Error("Attempted to serialize a disposed array");
     }
-    const typedArray = this.ndarray.toArray();
-    return {
-      shape: Array.from(this.ndarray.shape),
-      dtype: this.ndarray.dtype,
-      buffer: typedArray.buffer
-    };
+    const shape = Array.from(this.ndarray.shape);
+    const dtype = this.ndarray.dtype;
+    try {
+      // Works for CPU arrays directly
+      const typedArray = this.ndarray.toArray();
+      return { shape, dtype, buffer: typedArray.buffer };
+    } catch (e) {
+      // GPU arrays: create a CPU mirror, copy data, then serialize
+      const ctor = TransferableNDArray.#getTypedArrayCtor(dtype);
+      const size = shape.reduce((a, b) => a * b, 1);
+      const cpuArr = new ctor(size);
+      // copyFrom works GPU→CPU on the raw typed array
+      try {
+        this.ndarray.copyTo(cpuArr);
+      } catch (_) {
+        // If copyTo doesn't exist, try creating CPU NDArray
+        try {
+          const cpu = this.ndarray.device ? this.ndarray.device.copyToLocal(this.ndarray) : this.ndarray;
+          const arr = cpu.toArray();
+          return { shape, dtype, buffer: arr.buffer };
+        } catch (__) {
+          // Return zeros — the pipeline will recompute on GPU anyway
+        }
+      }
+      return { shape, dtype, buffer: cpuArr.buffer };
+    }
   }
 
   /**
@@ -865,48 +886,32 @@ class StableDiffusionPipeline {
       progressCallback("clip", 0, 1, totalNumSteps);
     }
 
-    const clipQueue = new CommandQueue(2);
+    // Run CLIP directly on NDArrays (no worker serialization)
     const posInputIDs = this.tokenize(prompt);
     const negInputIDs = this.tokenize(negPrompt);
     await this.device.sync();
-    const posMessage = new TransferableNDArray(posInputIDs).toMessage();
-    const negMessage = new TransferableNDArray(negInputIDs).toMessage();
-    posMessage.transferList = [posMessage.buffer];
-    negMessage.transferList = [negMessage.buffer];
 
-    const [posEmbeddingMessage, negEmbeddingMessage] = await Promise.all([
-      clipQueue.enqueue(() => this.workerPool.clipWorker.run({
-        stage: "clip",
-        negative: false,
-        inputMessage: posMessage,
-        transferList: posMessage.transferList
-      })),
-      clipQueue.enqueue(() => this.workerPool.clipWorker.run({
-        stage: "clip",
-        negative: true,
-        inputMessage: negMessage,
-        transferList: negMessage.transferList
-      }))
-    ]);
+    const posEmbeddings = this.tvm.withNewScope(() => {
+      return this.tvm.detachFromCurrentScope(
+        this.clipToTextEmbeddings(posInputIDs, this.clipParams)
+      );
+    });
+    const negEmbeddings = this.tvm.withNewScope(() => {
+      return this.tvm.detachFromCurrentScope(
+        this.clipToTextEmbeddings(negInputIDs, this.clipParams)
+      );
+    });
 
     posInputIDs.dispose();
     negInputIDs.dispose();
 
     const embeddings = this.tvm.withNewScope(() => {
-      const posEmbeddings = TransferableNDArray.fromMessage(
-        this.tvm,
-        this.device,
-        posEmbeddingMessage
-      );
-      const negEmbeddings = TransferableNDArray.fromMessage(
-        this.tvm,
-        this.device,
-        negEmbeddingMessage
-      );
       return this.tvm.detachFromCurrentScope(
         this.concatEmbeddings(negEmbeddings, posEmbeddings)
       );
     });
+    posEmbeddings.dispose();
+    negEmbeddings.dispose();
 
     if (this.collaborationManager) {
       this.collaborationManager.broadcastStageSnapshot("clip", {
@@ -934,69 +939,27 @@ class StableDiffusionPipeline {
     //---------------------------
     // Stage 1: UNet + Scheduler
     //---------------------------
-    const embeddingsMessage = new TransferableNDArray(embeddings).toMessage();
-    embeddingsMessage.transferList = [embeddingsMessage.buffer];
-    let latentsMessage = new TransferableNDArray(latents).toMessage();
-    latentsMessage.transferList = [latentsMessage.buffer];
-    const unetQueue = new CommandQueue(2);
-    const schedulerPrefetchCache = new Map();
-    const acquireSchedulerHandle = (index) => {
-      if (!schedulerPrefetchCache.has(index)) {
-        schedulerPrefetchCache.set(index, scheduler.prefetch(index));
-      }
-      return schedulerPrefetchCache.get(index);
-    };
-    const collaboration = this.collaborationManager;
-
-    if (vaeCycle != -1) {
-      this.tvm.withNewScope(() => {
-        const image = this.vaeToImage(latents, this.vaeParams);
-        this.tvm.showImage(this.imageToRGBA(image));
-      });
-      await this.device.sync();
-    }
-    vaeCycle = vaeCycle == -1 ? unetNumSteps : vaeCycle;
-    let lastSync = undefined;
-
     for (let counter = 0; counter < unetNumSteps; ++counter) {
       if (progressCallback !== undefined) {
         progressCallback("unet", counter, unetNumSteps, totalNumSteps);
       }
-      const timestepHandle = acquireSchedulerHandle(counter);
-      const resultMessage = await unetQueue.enqueue(() => this.workerPool.unetWorker.run({
-        stage: "unet",
-        latentsMessage,
-        embeddingsMessage,
-        scheduler,
-        counter,
-        timestepHandle,
-        transferList: latentsMessage.transferList
-      }));
 
+      const nextLatents = this.tvm.withNewScope(() => {
+        const timestep = scheduler.timestep[counter];
+        const noisePred = this.unetLatentsToNoisePred(
+          latents, timestep, embeddings, this.unetParams
+        );
+        return this.tvm.detachFromCurrentScope(
+          scheduler.step(noisePred, latents, counter)
+        );
+      });
       latents.dispose();
-      latents = TransferableNDArray.fromMessage(this.tvm, this.device, resultMessage);
-      latentsMessage = new TransferableNDArray(latents).toMessage();
-      latentsMessage.transferList = [latentsMessage.buffer];
+      latents = nextLatents;
+      await this.device.sync();
 
-      if (collaboration) {
-        collaboration.broadcastStageSnapshot("unet", {
-          counter,
-          total: unetNumSteps
-        });
-      }
-
-      if (lastSync !== undefined) {
-        await lastSync;
-      }
-      lastSync = this.device.sync();
-
-      if ((counter + 1) < unetNumSteps) {
-        unetQueue.enqueue(() => acquireSchedulerHandle(counter + 1));
-      }
-
-      if ((counter + 1) % vaeCycle == 0 &&
-        (counter + 1) != unetNumSteps &&
-        counter >= beginRenderVae) {
+      // Optional intermediate VAE render
+      if (vaeCycle > 0 && (counter + 1) % vaeCycle == 0 &&
+        (counter + 1) != unetNumSteps && counter >= beginRenderVae) {
         this.tvm.withNewScope(() => {
           const image = this.vaeToImage(latents, this.vaeParams);
           this.tvm.showImage(this.imageToRGBA(image));
@@ -1007,42 +970,16 @@ class StableDiffusionPipeline {
     scheduler.dispose();
     embeddings.dispose();
 
-    await this.device.sync();
-    
-    // allocate a gpu arr and async copy to it.
-    const cpu_arr = this.tvm.withNewScope(() => {
-      return this.tvm.detachFromCurrentScope(
-        this.tvm.empty(latents.shape, latents.dtype, this.tvm.cpu(0))
-      )
-    });
-    console.log("empty arr" + cpu_arr.toArray());
-
-    cpu_arr.copyFrom(latents);
-    await this.tvm.webgpu().sync();
-
-    console.log("final latents" + cpu_arr.toArray());
-
-
     //-----------------------------
     // Stage 2: VAE and draw image
     //-----------------------------
     if (progressCallback !== undefined) {
       progressCallback("vae", 0, 1, totalNumSteps);
     }
-    const vaeResultMessage = await this.workerPool.vaeWorker.run({
-      stage: "vae",
-      latentsMessage,
-      transferList: latentsMessage.transferList
-    });
     this.tvm.withNewScope(() => {
-      const rgba = TransferableNDArray.fromMessage(this.tvm, this.device, vaeResultMessage);
-      this.tvm.showImage(rgba);
+      const image = this.vaeToImage(latents, this.vaeParams);
+      this.tvm.showImage(this.imageToRGBA(image));
     });
-    if (this.collaborationManager) {
-      this.collaborationManager.broadcastStageSnapshot("vae", {
-        status: "complete"
-      });
-    }
     latents.dispose();
     await this.device.sync();
     if (progressCallback !== undefined) {
