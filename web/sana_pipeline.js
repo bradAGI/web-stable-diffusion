@@ -138,10 +138,9 @@ class SanaPipeline {
       const timestep = 1.0 - (step / steps);
 
       const feeds = {};
-      // Pass as float32 — let onnxruntime handle fp16 conversion internally
-      feeds["hidden_states"] = new this.ort.Tensor("float32", new Float32Array(currentLatent), [1, latentChannels, latentSize, latentSize]);
-      feeds["encoder_hidden_states"] = new this.ort.Tensor("float32", new Float32Array(sanaEmbedding), [1, 300, 2304]);
-      feeds["timestep"] = new this.ort.Tensor("float32", new Float32Array([timestep]), [1]);
+      feeds["hidden_states"] = new this.ort.Tensor("float16", new Uint16Array(this._f32ToF16(currentLatent)), [1, latentChannels, latentSize, latentSize]);
+      feeds["encoder_hidden_states"] = new this.ort.Tensor("float16", new Uint16Array(this._f32ToF16(sanaEmbedding)), [1, 300, 2304]);
+      feeds["timestep"] = new this.ort.Tensor("float16", new Uint16Array(this._f32ToF16(new Float32Array([timestep]))), [1]);
 
       // Log all feed shapes before running
       for (const [k, v] of Object.entries(feeds)) {
@@ -352,16 +351,34 @@ class SanaPipeline {
 
   _f32ToF16(f32arr) {
     const u16 = new Uint16Array(f32arr.length);
+    const buf = new ArrayBuffer(4);
+    const f32View = new Float32Array(buf);
+    const u32View = new Uint32Array(buf);
     for (let i = 0; i < f32arr.length; i++) {
-      const view = new DataView(new ArrayBuffer(4));
-      view.setFloat32(0, f32arr[i]);
-      const bits = view.getUint32(0);
-      const sign = (bits >> 16) & 0x8000;
-      const exp = ((bits >> 23) & 0xff) - 127 + 15;
-      const mantissa = (bits >> 13) & 0x3ff;
-      if (exp <= 0) u16[i] = sign;
-      else if (exp >= 31) u16[i] = sign | 0x7c00;
-      else u16[i] = sign | (exp << 10) | mantissa;
+      f32View[0] = f32arr[i];
+      const x = u32View[0];
+      const sign = (x >>> 16) & 0x8000;
+      const exponent = ((x >>> 23) & 0xff);
+      const mantissa = x & 0x7fffff;
+
+      if (exponent === 0) {
+        // Zero or denorm — flush to zero
+        u16[i] = sign;
+      } else if (exponent === 255) {
+        // Inf or NaN
+        u16[i] = sign | 0x7c00 | (mantissa ? 0x200 : 0);
+      } else {
+        const newExp = exponent - 127 + 15;
+        if (newExp >= 31) {
+          // Overflow — clamp to fp16 max
+          u16[i] = sign | 0x7bff;
+        } else if (newExp <= 0) {
+          // Underflow — flush to zero
+          u16[i] = sign;
+        } else {
+          u16[i] = sign | (newExp << 10) | (mantissa >>> 13);
+        }
+      }
     }
     return u16;
   }
