@@ -52,8 +52,10 @@ class SanaPipeline {
     }
 
     const sessionOptions = {
-      executionProviders: ["webgpu", "wasm"],
+      executionProviders: ["webgpu"],
       graphOptimizationLevel: "all",
+      // Prefer loading model data to GPU memory directly
+      preferredOutputLocation: "gpu-buffer",
     };
 
     const steps = 4; // tokenizer + text encoder + dit + vae
@@ -75,8 +77,23 @@ class SanaPipeline {
       if (onProgress) onProgress(`Loading text encoder (${encConfig.size}, ${encConfig.label})...`, step, steps);
       const textEncUrl = `${MODEL_BASE_URL}/${encConfig.file}`;
       console.log("Loading text encoder from:", textEncUrl);
-      this.textEncoderSession = await this.ort.InferenceSession.create(textEncUrl, sessionOptions);
-      this._textEncoderQuality = quality;
+      try {
+        this.textEncoderSession = await this.ort.InferenceSession.create(textEncUrl, sessionOptions);
+        this._textEncoderQuality = quality;
+      } catch (e) {
+        console.warn(`Failed to load ${quality} text encoder on WebGPU:`, e.message);
+        // INT8 quantized ops may not be supported by WebGPU EP — fall back to fp16
+        if (quality === "int8") {
+          const fp16Config = TEXT_ENCODER_FILES["fp16"];
+          if (onProgress) onProgress(`INT8 not supported on this GPU, loading FP16 (${fp16Config.size})...`, step, steps);
+          const fp16Url = `${MODEL_BASE_URL}/${fp16Config.file}`;
+          console.log("Falling back to fp16:", fp16Url);
+          this.textEncoderSession = await this.ort.InferenceSession.create(fp16Url, sessionOptions);
+          this._textEncoderQuality = "fp16";
+        } else {
+          throw e;
+        }
+      }
       step++;
     }
 

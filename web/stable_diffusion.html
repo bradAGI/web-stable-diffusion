@@ -252,6 +252,13 @@
 
     <!-- ONNX Runtime Web with WebGPU -->
     <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.21.0/dist/ort.webgpu.min.js"></script>
+    <script>
+      // Configure ONNX Runtime for large models
+      if (typeof ort !== "undefined") {
+        ort.env.wasm.numThreads = navigator.hardwareConcurrency || 4;
+        ort.env.wasm.simd = true;
+      }
+    </script>
     <!-- Sana ONNX Pipeline -->
     <script src="sana_pipeline.js"></script>
   </body>
