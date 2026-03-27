@@ -142,13 +142,16 @@ class SanaPipeline {
         if (name.includes("hidden") || name === "hidden_states") {
           feeds[name] = new this.ort.Tensor("float16", new Uint16Array(this._f32ToF16(currentLatent)), [1, latentChannels, latentSize, latentSize]);
         } else if (name.includes("encoder") || name === "encoder_hidden_states") {
-          // Must be rank 3: [batch, seq_len, hidden_dim]
-          const embF16 = new Uint16Array(this._f32ToF16(sanaEmbedding));
-          feeds[name] = new this.ort.Tensor("float16", embF16, [1, 300, 2304]);
-          console.log("encoder_hidden_states shape:", [1, 300, 2304], "data length:", embF16.length);
+          feeds[name] = new this.ort.Tensor("float16", new Uint16Array(this._f32ToF16(sanaEmbedding)), [1, 300, 2304]);
+          console.log("encoder_hidden_states tensor dims:", feeds[name].dims, "type:", feeds[name].type, "size:", feeds[name].size);
         } else if (name.includes("time") || name === "timestep") {
           feeds[name] = new this.ort.Tensor("float16", new Uint16Array(this._f32ToF16(new Float32Array([timestep]))), [1]);
         }
+      }
+
+      // Log all feed shapes before running
+      for (const [k, v] of Object.entries(feeds)) {
+        console.log(`Feed "${k}": dims=${JSON.stringify(v.dims)}, type=${v.type}, size=${v.size}`);
       }
 
       try {
