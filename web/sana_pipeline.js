@@ -166,6 +166,15 @@ class SanaPipeline {
       }
     }
 
+    // Debug: check latent stats after denoising
+    let lmin = Infinity, lmax = -Infinity, lsum = 0;
+    for (let i = 0; i < currentLatent.length; i++) {
+      if (currentLatent[i] < lmin) lmin = currentLatent[i];
+      if (currentLatent[i] > lmax) lmax = currentLatent[i];
+      lsum += currentLatent[i];
+    }
+    console.log("Latent stats after denoising - min:", lmin.toFixed(4), "max:", lmax.toFixed(4), "mean:", (lsum / currentLatent.length).toFixed(4));
+
     // Step 4: VAE decode
     if (onProgress) onProgress("Decoding image...", steps + 1, totalSteps);
     const vaeFeed = {};
@@ -174,8 +183,20 @@ class SanaPipeline {
     try {
       const output = await this.vaeSession.run(vaeFeed);
       const imgTensor = Object.values(output)[0];
+      const rawData = imgTensor.cpuData || imgTensor.data;
+
+      // Debug: check output range
+      const f32 = rawData instanceof Float32Array ? rawData : (rawData.constructor === Uint16Array ? this._f16ToF32(rawData) : new Float32Array(rawData));
+      let min = Infinity, max = -Infinity, sum = 0;
+      for (let i = 0; i < Math.min(f32.length, 10000); i++) {
+        if (f32[i] < min) min = f32[i];
+        if (f32[i] > max) max = f32[i];
+        sum += f32[i];
+      }
+      console.log("VAE output stats - min:", min.toFixed(4), "max:", max.toFixed(4), "mean:", (sum / Math.min(f32.length, 10000)).toFixed(4), "shape:", imgTensor.dims);
+
       if (onProgress) onProgress("Done!", totalSteps, totalSteps);
-      return this._tensorToImageData(imgTensor.cpuData || imgTensor.data, resolution, resolution);
+      return this._tensorToImageData(rawData, resolution, resolution);
     } catch (e) {
       console.error("VAE failed:", e);
       throw e;
