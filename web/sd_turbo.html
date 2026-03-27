@@ -76,9 +76,11 @@
     </div>
 
     <script type="module">
-      // Import web-txt2img direct API (no worker needed)
-      import { loadModel, generateImage, isModelLoaded } from './node_modules/web-txt2img/dist/index.js';
+      // Import dependencies
       import * as ort from './node_modules/onnxruntime-web/dist/ort.all.mjs';
+      import { AutoTokenizer } from './node_modules/@xenova/transformers/dist/transformers.min.js';
+      // Import web-txt2img direct API
+      import { loadModel, generateImage, isModelLoaded } from './node_modules/web-txt2img/dist/index.js';
 
       const statusEl = document.getElementById("status");
       const progressEl = document.getElementById("progress");
@@ -143,6 +145,13 @@
         const loadResult = await loadModel("sd-turbo", {
           ort: ort,
           backendPreference: ["webgpu"],
+          tokenizerProvider: async () => {
+            const tokenizer = await AutoTokenizer.from_pretrained("openai/clip-vit-large-patch14");
+            return (text) => {
+              const encoded = tokenizer(text, { padding: true, truncation: true, max_length: 77 });
+              return encoded.input_ids.data;
+            };
+          },
           progressCallback: (info) => {
             console.log("Load progress:", info);
             if (info.phase) setStatus("Loading: " + info.phase);
