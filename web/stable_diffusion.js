@@ -807,7 +807,9 @@ class StableDiffusionPipeline {
    * async preload webgpu pipelines when possible.
    */
   async asyncLoadWebGPUPipelines() {
-    await this.tvm.asyncLoadWebGPUPipelines(this.vm.getInternalModule());
+    if (typeof this.tvm.asyncLoadWebGPUPipelines === "function") {
+      await this.tvm.asyncLoadWebGPUPipelines(this.vm.getInternalModule());
+    }
   }
 
   /**
@@ -1151,7 +1153,9 @@ class DiffusionXLPipeline {
   }
 
   async asyncLoadWebGPUPipelines() {
-    await this.tvm.asyncLoadWebGPUPipelines(this.vm.getInternalModule());
+    if (typeof this.tvm.asyncLoadWebGPUPipelines === "function") {
+      await this.tvm.asyncLoadWebGPUPipelines(this.vm.getInternalModule());
+    }
   }
 
   async generate(
