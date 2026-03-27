@@ -7,7 +7,10 @@
 
 const MODEL_BASE_URL = "https://huggingface.co/brad-agi/sana-0.6b-onnx-webgpu/resolve/main";
 
-const TEXT_ENCODER_FILE = "sana_text_encoder_int8.onnx"; // int8 quantized, 2.5 GB
+const TEXT_ENCODER_FILES = {
+  "int8": { file: "sana_text_encoder_int8.onnx", size: "2.5 GB", label: "Faster download" },
+  "fp16": { file: "sana_text_encoder.onnx", size: "4.9 GB", label: "Best quality" },
+};
 const TOKENIZER_URL = `${MODEL_BASE_URL}/tokenizer/tokenizer.json`;
 
 const VARIANT_CONFIG = {
@@ -29,8 +32,11 @@ class SanaPipeline {
 
   /**
    * Initialize the pipeline for a given resolution variant.
+   * @param variant - "1024", "2048", or "4096"
+   * @param options.quality - "int8" (2.5 GB, fast) or "fp16" (4.9 GB, best quality)
+   * @param options.onProgress - progress callback
    */
-  async init(variant = "1024", { onProgress } = {}) {
+  async init(variant = "1024", { quality = "int8", onProgress } = {}) {
     if (!VARIANT_CONFIG[variant]) {
       throw new Error(`Unknown variant: ${variant}. Use "1024", "2048", or "4096".`);
     }
@@ -62,12 +68,15 @@ class SanaPipeline {
       step++;
     }
 
-    // Load text encoder (shared across resolutions)
-    if (!this.textEncoderSession) {
-      if (onProgress) onProgress("Loading text encoder (2.5 GB, cached after first use)...", step, steps);
-      const textEncUrl = `${MODEL_BASE_URL}/${TEXT_ENCODER_FILE}`;
+    // Load text encoder (shared across resolutions, reload if quality changes)
+    const encConfig = TEXT_ENCODER_FILES[quality] || TEXT_ENCODER_FILES["int8"];
+    if (!this.textEncoderSession || this._textEncoderQuality !== quality) {
+      if (this.textEncoderSession) await this.textEncoderSession.release();
+      if (onProgress) onProgress(`Loading text encoder (${encConfig.size}, ${encConfig.label})...`, step, steps);
+      const textEncUrl = `${MODEL_BASE_URL}/${encConfig.file}`;
       console.log("Loading text encoder from:", textEncUrl);
       this.textEncoderSession = await this.ort.InferenceSession.create(textEncUrl, sessionOptions);
+      this._textEncoderQuality = quality;
       step++;
     }
 

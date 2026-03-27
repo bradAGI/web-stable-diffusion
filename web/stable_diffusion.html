@@ -81,6 +81,13 @@
             <option value="30">30</option>
           </select>
         </div>
+        <div class="input-group" style="max-width: 200px;">
+          <label for="quality">Text Encoder</label>
+          <select id="quality">
+            <option value="int8" selected>INT8 — 2.5 GB (faster)</option>
+            <option value="fp16">FP16 — 4.9 GB (best quality)</option>
+          </select>
+        </div>
       </div>
 
       <div class="actions">
@@ -167,8 +174,10 @@
         generateBtn.disabled = false;
       }
 
-      async function ensurePipeline(variant) {
-        if (currentVariant === variant && sanaPipeline) return;
+      let currentQuality = null;
+
+      async function ensurePipeline(variant, quality) {
+        if (currentVariant === variant && currentQuality === quality && sanaPipeline) return;
 
         // Dispose old pipeline if switching resolution
         if (sanaPipeline) {
@@ -181,6 +190,7 @@
         generateBtn.textContent = "Loading model...";
 
         await sanaPipeline.init(variant, {
+          quality: quality,
           onProgress: function(msg, step, total) {
             setStatus(msg);
             setProgress((step / total) * 100);
@@ -188,6 +198,7 @@
         });
 
         currentVariant = variant;
+        currentQuality = quality;
       }
 
       generateBtn.addEventListener("click", async function() {
@@ -208,7 +219,8 @@
 
         try {
           // Load pipeline if needed
-          await ensurePipeline(res);
+          const quality = document.getElementById("quality").value;
+          await ensurePipeline(res, quality);
 
           // Generate
           const imageData = await sanaPipeline.generate(prompt, {
