@@ -480,10 +480,96 @@ def compile_sana_to_wasm():
     print("Download with: modal volume get sana-wasm-artifacts /artifacts/sana-wasm ./sana-wasm")
 
 
+@app.function(
+    image=compiler_image,
+    gpu="A100",
+    timeout=3600,
+    volumes={OUTPUT_DIR: vol},
+    memory=32768,
+)
+def export_text_encoder_only():
+    """Export only the Gemma text encoder + tokenizer (skip DiT/VAE)."""
+    import os
+    import torch
+
+    print("=" * 60)
+    print("Exporting Gemma text encoder only")
+    print("=" * 60)
+
+    from diffusers import SanaPipeline
+
+    pipe = SanaPipeline.from_pretrained(
+        SANA_MODEL_ID,
+        torch_dtype=torch.float16,
+        variant="fp16",
+    )
+    pipe = pipe.to("cuda")
+
+    text_encoder = pipe.text_encoder
+    text_encoder.eval()
+    tokenizer = pipe.tokenizer
+
+    class TextEncoderWrapper(torch.nn.Module):
+        def __init__(self, encoder):
+            super().__init__()
+            self.encoder = encoder
+
+        def forward(self, input_ids, attention_mask):
+            outputs = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
+            return outputs.last_hidden_state
+
+    text_enc_wrapper = TextEncoderWrapper(text_encoder).cuda().half().eval()
+
+    max_seq_len = 300
+    dummy_input_ids = torch.ones(1, max_seq_len, dtype=torch.long, device="cuda")
+    dummy_attention_mask = torch.ones(1, max_seq_len, dtype=torch.long, device="cuda")
+
+    os.makedirs(f"{OUTPUT_DIR}/sana-wasm", exist_ok=True)
+    text_enc_onnx_path = f"{OUTPUT_DIR}/sana-wasm/sana_text_encoder.onnx"
+
+    print("Exporting text encoder to ONNX...")
+    with torch.no_grad():
+        torch.onnx.export(
+            text_enc_wrapper,
+            (dummy_input_ids, dummy_attention_mask),
+            text_enc_onnx_path,
+            input_names=["input_ids", "attention_mask"],
+            output_names=["hidden_states"],
+            dynamic_axes={
+                "input_ids": {1: "seq_len"},
+                "attention_mask": {1: "seq_len"},
+                "hidden_states": {1: "seq_len"},
+            },
+            opset_version=18,
+        )
+    enc_size = os.path.getsize(text_enc_onnx_path) / 1e6
+    data_path = text_enc_onnx_path + ".data"
+    if os.path.exists(data_path):
+        enc_size += os.path.getsize(data_path) / 1e6
+    print(f"  ✓ Text encoder: {enc_size:.0f} MB")
+
+    tokenizer.save_pretrained(f"{OUTPUT_DIR}/sana-wasm/tokenizer")
+    print("  ✓ Tokenizer saved")
+
+    vol.commit()
+    print(f"\n✓ Text encoder saved to volume")
+    print("Download: modal volume get sana-wasm-artifacts /artifacts/sana-wasm/sana_text_encoder.onnx* .")
+
+
 @app.local_entrypoint()
 def main():
-    print("Starting Sana 0.6B WASM compilation on Modal A100...")
-    print("This will take ~30-60 minutes.")
-    compile_sana_to_wasm.remote()
+    import sys
+    mode = sys.argv[1] if len(sys.argv) > 1 else "text-encoder"
+
+    if mode == "all":
+        print("Starting full Sana 0.6B compilation on Modal A100...")
+        compile_sana_to_wasm.remote()
+    elif mode == "text-encoder":
+        print("Exporting Gemma text encoder only...")
+        export_text_encoder_only.remote()
+    else:
+        print(f"Unknown mode: {mode}. Use 'all' or 'text-encoder'.")
+        return
+
     print("\nDone! Download artifacts with:")
     print("  modal volume get sana-wasm-artifacts /artifacts/sana-wasm ./sana-wasm")
