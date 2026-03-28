@@ -116,7 +116,7 @@
       tvmjsGlobalEnv.getPrompt = function() { return promptEl.value.trim(); };
       tvmjsGlobalEnv.getNegativePrompt = function() { return negPromptEl.value.trim(); };
       tvmjsGlobalEnv.getSchedulerId = function() { return "0"; }; // DPM Solver
-      tvmjsGlobalEnv.getVaeCycle = function() { return 5; }; // Preview every 5 steps
+      tvmjsGlobalEnv.getVaeCycle = function() { return 1; }; // Preview every step
       tvmjsGlobalEnv.onGenerationLifecycle = function(stage) {
         if (stage === "start") { generateBtn.disabled = true; generateBtn.textContent = "Generating..."; setProgress(0); }
         else if (stage === "complete") { setStatus("Done!"); setProgress(100); }
