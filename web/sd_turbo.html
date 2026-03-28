@@ -149,11 +149,11 @@
           ort: ort,
           backendPreference: ["webgpu"],
           tokenizerProvider: async () => {
+            console.log("Loading CLIP tokenizer...");
             const tokenizer = await AutoTokenizer.from_pretrained("openai/clip-vit-large-patch14");
-            return (text) => {
-              const encoded = tokenizer(text, { padding: true, truncation: true, max_length: 77 });
-              return encoded.input_ids.data;
-            };
+            console.log("CLIP tokenizer loaded");
+            // Return the tokenizer callable — web-txt2img calls it as tok(text, opts)
+            return tokenizer;
           },
           progressCallback: (info) => {
             console.log("Load progress:", info);
