@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>SD 1.5 — Browser Image Generation (MLC/WebGPU)</title>
+    <style>
+      * { box-sizing: border-box; margin: 0; padding: 0; }
+      body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0a0a0a; color: #e0e0e0; min-height: 100vh; display: flex; flex-direction: column; align-items: center; }
+      h1 { font-size: 1.5rem; margin: 2rem 0 0.25rem; }
+      .subtitle { color: #888; font-size: 0.85rem; margin-bottom: 1.5rem; }
+      .container { width: 100%; max-width: 640px; padding: 0 1rem; }
+      .input-group { display: flex; flex-direction: column; gap: 0.5rem; margin-bottom: 1rem; }
+      label { font-size: 0.8rem; color: #aaa; }
+      textarea, input[type="text"] { background: #1a1a1a; border: 1px solid #333; border-radius: 8px; padding: 0.75rem; color: #fff; font-size: 0.9rem; resize: none; outline: none; }
+      textarea:focus, input:focus { border-color: #666; }
+      button { background: #fff; color: #000; border: none; border-radius: 8px; padding: 0.75rem 1.5rem; font-size: 0.9rem; font-weight: 600; cursor: pointer; transition: opacity 0.2s; }
+      button:hover { opacity: 0.85; }
+      button:disabled { opacity: 0.4; cursor: not-allowed; }
+      .canvas-wrap { margin: 1.5rem 0; display: flex; justify-content: center; }
+      canvas { border-radius: 8px; border: 1px solid #222; background: #111; }
+      #status { font-size: 0.8rem; color: #888; margin-bottom: 0.5rem; min-height: 1.2em; }
+      .progress-wrap { width: 100%; margin-bottom: 1rem; }
+      progress { width: 100%; height: 6px; appearance: none; border: none; border-radius: 3px; overflow: hidden; }
+      progress::-webkit-progress-bar { background: #222; border-radius: 3px; }
+      progress::-webkit-progress-value { background: #fff; border-radius: 3px; }
+      #gpu-status { font-size: 0.75rem; color: #666; margin-bottom: 1rem; }
+    </style>
+  </head>
+  <body>
+    <h1>Stable Diffusion 1.5</h1>
+    <p class="subtitle">512×512 · 10 steps · DPM Solver · Runs entirely in your browser via WebGPU</p>
+
+    <div class="container">
+      <div id="gpu-status">Checking WebGPU support...</div>
+      <div id="status"></div>
+      <div class="progress-wrap">
+        <progress id="progress" value="0" max="100"></progress>
+      </div>
+
+      <div class="input-group">
+        <label for="prompt">Prompt</label>
+        <textarea id="prompt" rows="3" placeholder="A photo of an astronaut riding a horse on mars">A photo of an astronaut riding a horse on mars</textarea>
+      </div>
+      <div class="input-group">
+        <label for="neg-prompt">Negative prompt (optional)</label>
+        <input type="text" id="neg-prompt" placeholder="blurry, low quality" value="" />
+      </div>
+
+      <button id="generate-btn" disabled>Loading...</button>
+
+      <div class="canvas-wrap">
+        <canvas id="canvas" width="512" height="512"></canvas>
+      </div>
+    </div>
+
+    <!-- TVM runtime -->
+    <script>
+      var tvmjsGlobalEnv = tvmjsGlobalEnv || {};
+
+      // Polyfill: modern Chrome removed adapter.requestAdapterInfo()
+      if (typeof navigator !== "undefined" && navigator.gpu) {
+        const origRequestAdapter = navigator.gpu.requestAdapter.bind(navigator.gpu);
+        navigator.gpu.requestAdapter = async function(options) {
+          const adapter = await origRequestAdapter(options);
+          if (adapter && !adapter.requestAdapterInfo) {
+            adapter.requestAdapterInfo = async function() {
+              return adapter.info || { vendor: "unknown", architecture: "", device: "", description: "" };
+            };
+          }
+          return adapter;
+        };
+      }
+    </script>
+    <script src="https://websd.mlc.ai/dist/tvmjs_runtime.wasi.js"></script>
+    <script src="https://websd.mlc.ai/dist/tvmjs.bundle.js"></script>
+
+    <!-- Tokenizer WASM -->
+    <script type="module">
+      import init, { TokenizerWasm } from "https://websd.mlc.ai/dist/tokenizers-wasm/tokenizers_wasm.js";
+      let initialized = false;
+      async function getTokenizer(name) {
+        if (!initialized) { await init(); initialized = true; }
+        const response = await fetch("https://huggingface.co/" + name + "/raw/main/tokenizer.json");
+        return new TokenizerWasm(await response.text());
+      }
+      tvmjsGlobalEnv.getTokenizer = getTokenizer;
+      window.__tokenizerReady = true;
+      window.dispatchEvent(new Event("tokenizer-ready"));
+    </script>
+
+    <!-- Override config path for 10-step scheduler -->
+    <script>
+      // Override the config file path before stable_diffusion.js loads
+      window.__sdConfigUrl = "sd15-config.json";
+    </script>
+    <!-- SD pipeline runtime -->
+    <script src="stable_diffusion.js"></script>
+
+    <!-- App logic -->
+    <script>
+      const statusEl = document.getElementById("status");
+      const progressEl = document.getElementById("progress");
+      const gpuStatusEl = document.getElementById("gpu-status");
+      const generateBtn = document.getElementById("generate-btn");
+      const promptEl = document.getElementById("prompt");
+      const negPromptEl = document.getElementById("neg-prompt");
+
+      function setStatus(msg) { statusEl.textContent = msg; }
+      function setProgress(val) { progressEl.value = val; }
+
+      // Wire UI hooks for MLC runtime
+      tvmjsGlobalEnv.logMessage = function(msg) { console.log(msg); setStatus(msg); };
+      tvmjsGlobalEnv.updateProgress = function(report) { setStatus(report.text); setProgress(report.progress * 100); };
+      tvmjsGlobalEnv.updateGpuStatus = function(msg) { gpuStatusEl.textContent = msg; };
+      tvmjsGlobalEnv.getPrompt = function() { return promptEl.value.trim(); };
+      tvmjsGlobalEnv.getNegativePrompt = function() { return negPromptEl.value.trim(); };
+      tvmjsGlobalEnv.getSchedulerId = function() { return "0"; }; // DPM Solver
+      tvmjsGlobalEnv.getVaeCycle = function() { return 5; }; // Preview every 5 steps
+      tvmjsGlobalEnv.onGenerationLifecycle = function(stage) {
+        if (stage === "start") { generateBtn.disabled = true; generateBtn.textContent = "Generating..."; setProgress(0); }
+        else if (stage === "complete") { setStatus("Done!"); setProgress(100); }
+        else if (stage === "error") { setStatus("Generation failed. Check console."); }
+        else if (stage === "end") { generateBtn.disabled = false; generateBtn.textContent = "Generate"; }
+      };
+
+      function waitForReady() {
+        if (!window.__tokenizerReady) {
+          window.addEventListener("tokenizer-ready", onReady, { once: true });
+        } else {
+          onReady();
+        }
+      }
+
+      function onReady() {
+        setStatus("Ready! Enter a prompt and click Generate.");
+        generateBtn.textContent = "Generate";
+        generateBtn.disabled = false;
+      }
+
+      generateBtn.addEventListener("click", async function() {
+        if (typeof localStableDiffusionInst === "undefined") {
+          setStatus("SD runtime not loaded yet.");
+          return;
+        }
+        await localStableDiffusionInst.generate();
+      });
+
+      waitForReady();
+    </script>
+  </body>
+</html>

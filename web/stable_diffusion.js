@@ -1377,7 +1377,8 @@ class StableDiffusionInstance {
    */
   async #asyncInitConfig() {
     if (this.config !== undefined) return;
-    this.config = await (await fetch("stable-diffusion-config.json")).json();
+    const configUrl = (typeof window !== "undefined" && window.__sdConfigUrl) || "stable-diffusion-config.json";
+    this.config = await (await fetch(configUrl)).json();
   
     var model_param_url = undefined;
     var model_lib_url = undefined;
